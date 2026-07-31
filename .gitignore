@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyproj
+*.egg-info/
+.eggs/
+*.so
+
+# Database / runtime
+*.db
+*.lance/
+*.sqlite3
+._db/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*

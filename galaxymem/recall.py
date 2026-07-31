@@ -1,0 +1,538 @@
+"""Recall — hot cache injection + deep recall with RRF fusion and spreading activation.
+
+Handles:
+- Hot working memory cache (frequently-accessed memories injected into every prompt)
+- Deep recall with hybrid search (vector + keyword) fused via Reciprocal Rank Fusion
+- Spreading activation through the memory graph to boost connected memories
+- Prompt formatting for context injection
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+
+from . import config as cfg
+from .models import HotCache, MemoryRecord, MemoryStatus
+from .store import Store
+
+logger = logging.getLogger(__name__)
+
+
+# ── Brightness computation ─────────────────────────────────────────────
+
+def _brightness(memory: MemoryRecord, now: Optional[datetime] = None) -> float:
+    """Compute memory brightness per the spec decay formula:
+
+        brightness = max(floor, exp(-days_since_last_recall / half_life) * 0.7
+                                + importance_proxy * 0.3)
+
+    Decay is anchored on last_recalled_at (falling back to created_at for
+    never-recalled memories) — recalling a memory arrests its decay.
+    importance_proxy = recall_count normalized to 0–1 (capped at 10 recalls).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    anchor = memory.last_recalled_at or memory.created_at
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+
+    days_since = max(0.0, (now - anchor).total_seconds() / 86400.0)
+    decay = math.exp(-days_since / cfg.DECAY_HALF_LIFE_DAYS)
+    importance = min(1.0, memory.recall_count / 10.0)
+    return max(cfg.BRIGHTNESS_FLOOR, decay * 0.7 + importance * 0.3)
+
+
+def _relevance_score(memory: MemoryRecord, now: Optional[datetime] = None) -> float:
+    """Composite relevance score for hot cache ranking.
+
+    Score = (recall_count + 1) * brightness
+    The +1 ensures memories with 0 recalls still have non-zero score.
+    """
+    return (memory.recall_count + 1) * _brightness(memory, now)
+
+
+# ── Hot working memory cache ───────────────────────────────────────────
+
+def get_hot_cache(store: Store, entity_ids: Optional[list[str]] = None) -> list[MemoryRecord]:
+    """Return top N memories by (recall_count * brightness), respecting token budget.
+
+    Prioritizes recent, frequently-recalled, high-brightness memories.
+    If entity_ids is provided, filters to memories associated with those entities.
+
+    Returns:
+        List of MemoryRecord, sorted by relevance descending, within token budget.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Fetch a reasonable upper-bound of active memories at the DB level.
+    # load only id/recall_count/last_recalled_at/created_at/text/entity_ids first,
+    # sort by relevance, then take top N. This avoids loading 50k+ records
+    # into pandas on every hot_cache injection.
+    MAX_CANDIDATES = max(cfg.HOT_CACHE_K * 10, 200)  # generous upper bound
+
+    try:
+        df = store._memories.search().where(
+            'status = "active"'
+        ).limit(MAX_CANDIDATES).to_pandas()
+    except Exception:
+        # Fallback for stores that don't support limit
+        df = store._memories.search().where('status = "active"').to_pandas()
+        df = df.sort_values("recall_count", ascending=False).head(MAX_CANDIDATES)
+
+    if df.empty:
+        return []
+
+    from .store import _from_memory
+
+    memories = []
+    scores = []
+    for _, row in df.iterrows():
+        mem = _from_memory(row.to_dict())
+        # Filter by entity_ids if provided. Unscoped memories (general
+        # knowledge) ride along, mirroring the D8 recall scope.
+        if entity_ids and mem.entity_ids and \
+                not any(eid in mem.entity_ids for eid in entity_ids):
+            continue
+        score = _relevance_score(mem, now)
+        memories.append(mem)
+        scores.append(score)
+
+    if not memories:
+        return []
+
+    # Sort by relevance score descending
+    paired = sorted(zip(scores, memories), key=lambda x: x[0], reverse=True)
+
+    # Respect token budget (rough: 1 token ≈ 4 chars) and max items
+    token_budget = cfg.HOT_CACHE_TOKEN_BUDGET
+    max_items = cfg.HOT_CACHE_K
+    result = []
+    tokens_used = 0
+
+    for score, mem in paired:
+        if len(result) >= max_items:
+            break
+        # Rough token estimate: len(text) / 4
+        est_tokens = len(mem.text) // 4 + 1
+        if tokens_used + est_tokens > token_budget and result:
+            break
+        result.append(mem)
+        tokens_used += est_tokens
+
+    return result
+
+
+def update_hot_cache(store: Store, entity_id: Optional[str] = None) -> HotCache:
+    """Refresh the hot cache and persist it to the store.
+
+    Args:
+        store: The LanceDB store.
+        entity_id: Optional entity to scope the cache to. If None, global cache.
+
+    Returns:
+        The updated HotCache record.
+    """
+    entity_ids = [entity_id] if entity_id else None
+    memories = get_hot_cache(store, entity_ids=entity_ids)
+
+    cache_entity_id = entity_id or "__global__"
+    memory_ids = [m.id for m in memories]
+    rendered = format_memories_for_prompt(memories)
+
+    cache = HotCache(
+        entity_id=cache_entity_id,
+        memory_ids=memory_ids,
+        rendered=rendered,
+    )
+    store.save_hot_cache(cache)
+    logger.info("Updated hot cache for %s: %d memories", cache_entity_id, len(memory_ids))
+    return cache
+
+
+# ── Reciprocal Rank Fusion ─────────────────────────────────────────────
+
+def rrf_score(rank: int, k: Optional[int] = None) -> float:
+    """Compute RRF score for a given rank.
+
+    RRF(d) = 1.0 / (k + rank)
+
+    Args:
+        rank: 1-indexed rank position.
+        k: Smoothing constant (default from config RRF_K).
+
+    Returns:
+        RRF score contribution.
+    """
+    if k is None:
+        k = cfg.RRF_K
+    return 1.0 / (k + rank)
+
+
+def _fuse_rrf(
+    vector_results: list[tuple[MemoryRecord, float]],
+    keyword_results: list[tuple[MemoryRecord, float]],
+) -> dict[str, float]:
+    """Fuse vector and keyword search results using Reciprocal Rank Fusion.
+
+    For each candidate memory, sums RRF scores from its rank in vector results
+    and its rank in keyword results.
+
+    Returns:
+        Dict mapping memory_id -> combined RRF score.
+    """
+    scores: dict[str, float] = defaultdict(float)
+
+    # Vector search ranks (1-indexed)
+    for rank, (mem, _score) in enumerate(vector_results, start=1):
+        scores[mem.id] += rrf_score(rank)
+
+    # Keyword search ranks (1-indexed)
+    for rank, (mem, _score) in enumerate(keyword_results, start=1):
+        scores[mem.id] += rrf_score(rank)
+
+    return dict(scores)
+
+
+# ── Spreading activation ───────────────────────────────────────────────
+
+def spreading_activation(
+    store: Store,
+    seed_memory_ids: list[str],
+    max_hops: int = 1,  # single hop in v1 per spec D9
+    decay: Optional[float] = None,
+    min_weight: Optional[float] = None,
+) -> dict[str, float]:
+    """BFS spreading activation from seed memories through the edge graph.
+
+    Starting from seed memories, propagate activation through edges with
+    exponential decay per hop. Memories reachable via edges get a boost
+    proportional to their edge weight and distance from seeds.
+
+    Args:
+        store: The LanceDB store.
+        seed_memory_ids: Starting memory IDs to activate from.
+        max_hops: Maximum graph traversal depth.
+        decay: Activation decay per hop (default from config ACTIVATION_DAMPING).
+        min_weight: Minimum edge weight to traverse (default ACTIVATION_MIN_WEIGHT).
+
+    Returns:
+        Dict mapping memory_id -> activation score (0.0 to 1.0).
+    """
+    if decay is None:
+        decay = cfg.ACTIVATION_DAMPING
+    if min_weight is None:
+        min_weight = cfg.ACTIVATION_MIN_WEIGHT
+
+    activation: dict[str, float] = {}
+
+    # Seeds start with activation 1.0
+    for sid in seed_memory_ids:
+        activation[sid] = 1.0
+
+    # BFS frontier: {memory_id: current_activation}
+    frontier = {sid: 1.0 for sid in seed_memory_ids}
+
+    for _hop in range(max_hops):
+        next_frontier: dict[str, float] = {}
+        for mem_id, current_activation in frontier.items():
+            try:
+                neighbors = store.neighbors(mem_id, min_weight=min_weight)
+            except Exception:
+                continue
+
+            for neighbor_id, edge in neighbors:
+                # Activation = parent_activation * edge_weight * decay
+                new_activation = current_activation * edge.weight * decay
+                if new_activation < min_weight * decay:
+                    continue
+                # Take max if already visited
+                if neighbor_id in activation:
+                    if new_activation > activation[neighbor_id]:
+                        activation[neighbor_id] = new_activation
+                        next_frontier[neighbor_id] = new_activation
+                else:
+                    activation[neighbor_id] = new_activation
+                    next_frontier[neighbor_id] = new_activation
+
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    return activation
+
+
+# ── Deep recall ────────────────────────────────────────────────────────
+
+def deep_recall(
+    query: str,
+    store: Store,
+    entity_ids: Optional[list[str]] = None,
+    limit: Optional[int] = None,
+    use_spreading: bool = True,
+    as_of: Optional[datetime] = None,
+) -> list[MemoryRecord]:
+    """Deep recall per Phase 4 of the spec.
+
+    1. Hard entity filter (D8): requested entities + self + unscoped world
+       facts. Contested/demoted/archived excluded; superseded excluded unless
+       the query is temporal.
+    2. Hybrid retrieval: vector + keyword within the filtered set.
+    3. RRF fusion.
+    4. Decay boost: fused score × (0.5 + 0.5 × brightness).
+    5. Spreading activation (D9): neighbors of the top 5, single hop,
+       neighbor_score = parent_score × weight × damping.
+    6. Return top-k with metadata.
+    7. Touch every returned memory (recall arrests decay) and nudge
+       co-recalled edge weights up.
+    8. Temporal mode (`as_of`): same pipeline against the historical store,
+       no touching, no edge writes, superseded included.
+
+    Returns:
+        List of MemoryRecord, ranked by combined score.
+    """
+    if limit is None:
+        limit = cfg.RECALL_DEFAULT_K
+
+    if not query or not query.strip():
+        return []
+
+    # Query expansion: via aux LLM, broaden the query for better coverage.
+    # Only when an LLM client is explicitly injected by the caller (agent-side
+    # providers do their own expansion in _handle_recall). When present,
+    # expand_query uses the injected LLM client.
+    temporal = as_of is not None
+    if use_spreading and not temporal:
+        from .queryexpansion import should_expand, expand_query
+        try:
+            _llm = getattr(deep_recall, '_llm_client', None)
+            if _llm is not None and should_expand(query, entity_ids):
+                query = expand_query(query, _llm)
+        except Exception as e:
+            logger.debug("Query expansion skipped: %s", e)
+
+    search_k = cfg.RECALL_SEARCH_K
+    search_store = store  # default; only swapped if as_of succeeds
+    if temporal:
+        search_store = store.as_of(as_of)  # may raise; search_store stays = store
+
+    try:
+        # Step 1: hard scope. Requested entities always include self (D8).
+        scoped_entities = None
+        if entity_ids:
+            scoped_entities = list(dict.fromkeys([*entity_ids, "self"]))
+
+        exclude = [MemoryStatus.demoted, MemoryStatus.contested, MemoryStatus.archived]
+        if not temporal:
+            exclude.append(MemoryStatus.superseded)
+
+        # Vector and keyword searches are independent — one failing should
+        # not kill the other. RRF handles empty result lists gracefully.
+        vector_results = []
+        keyword_results = []
+        try:
+            vector_results = search_store.vector_search(
+                query, k=search_k,
+                entity_filter=scoped_entities,
+                exclude_status=exclude,
+                include_unscoped_world=scoped_entities is not None,
+            )
+        except Exception as e:
+            logger.warning("Vector search failed, continuing with keyword only: %s", e)
+        try:
+            keyword_results = search_store.keyword_search(
+                query, k=search_k,
+                entity_filter=scoped_entities,
+                exclude_status=exclude,
+                include_unscoped_world=scoped_entities is not None,
+            )
+        except Exception as e:
+            logger.warning("Keyword search failed, continuing with vector only: %s", e)
+
+        # Step 2: RRF fusion
+        rrf_scores = _fuse_rrf(vector_results, keyword_results)
+        if not rrf_scores:
+            return []
+
+        candidates: dict[str, MemoryRecord] = {}
+        for mem, _ in vector_results:
+            candidates.setdefault(mem.id, mem)
+        for mem, _ in keyword_results:
+            candidates.setdefault(mem.id, mem)
+
+        # Step 3: decay boost — fused score × (0.5 + 0.5 × brightness)
+        now = datetime.now(timezone.utc)
+        final_scores: dict[str, float] = {
+            mem_id: rrf_scores[mem_id] * (0.5 + 0.5 * _brightness(candidates[mem_id], now))
+            for mem_id in rrf_scores
+        }
+
+        # Step 4: spreading activation from the top 5 boosted results.
+        # Edges are not versioned, so temporal queries skip this leg.
+        if use_spreading and not temporal:
+            top_seed_ids = sorted(final_scores, key=final_scores.get, reverse=True)[:5]
+            for seed_id in top_seed_ids:
+                parent_score = final_scores[seed_id]
+                try:
+                    neighbors = store.neighbors(seed_id, min_weight=cfg.ACTIVATION_MIN_WEIGHT)
+                except Exception:
+                    continue
+                for neighbor_id, edge in neighbors:
+                    if neighbor_id in final_scores:
+                        continue  # already a search hit; don't double-count
+                    mem = store.get_memory(neighbor_id)
+                    if mem is None or mem.status != MemoryStatus.active:
+                        continue
+                    candidates[neighbor_id] = mem
+                    final_scores[neighbor_id] = (
+                        parent_score * edge.weight * cfg.ACTIVATION_DAMPING
+                    )
+
+        ranked_ids = sorted(final_scores, key=final_scores.get, reverse=True)
+
+        # Step 4b: cross-encoder rerank — re-read query+memory pairs through a
+        # dedicated cross-encoder for paired relevance. Encoders measure
+        # semantic similarity; the cross-encoder measures "is this memory
+        # actually the answer to THIS query" — which closes the precision gap
+        # that makes session search feel random.
+        try:
+            from .rerank import rerank as _apply_rerank
+            ranked_with_scores = [(candidates[mid], final_scores[mid]) for mid in ranked_ids]
+            reranked = _apply_rerank(query, ranked_with_scores)
+            if reranked:
+                ranked_ids = [m.id for m, _ in reranked]
+        except Exception as e:
+            # Rerank is best-effort; never break recall because of it.
+            logger.debug("Cross-encoder rerank skipped (%s)", e)
+
+        top_ids = ranked_ids[:limit]
+        results = [candidates[mem_id] for mem_id in top_ids]
+
+        # Step 5: reinforcement — skip entirely in temporal mode
+        if not temporal:
+            for mem_id in top_ids:
+                try:
+                    store.touch_memory(mem_id)
+                except Exception as e:
+                    logger.warning("Failed to touch memory %s: %s", mem_id, e)
+            _nudge_corecalled_edges(store, top_ids)
+
+        logger.info(
+            "Deep recall for '%s'%s: %d candidates → %d results",
+            query, f" as of {as_of.isoformat()}" if temporal else "",
+            len(candidates), len(results),
+        )
+        return results
+    finally:
+        # Close the temporal store's table handle to prevent fd leak.
+        # The live store's tables are managed by the provider's lifecycle.
+        if temporal and search_store is not store:
+            try:
+                search_store.close()
+            except Exception:
+                pass
+
+
+def _nudge_corecalled_edges(store: Store, memory_ids: list[str],
+                            step: float = 0.05) -> None:
+    """Strengthen edges between co-recalled memories (Phase 4 step 7)."""
+    if len(memory_ids) < 2:
+        return
+    id_set = set(memory_ids)
+    seen: set[tuple[str, str, str]] = set()
+    for mem_id in memory_ids:
+        try:
+            edges = store.get_edges_for_memory(mem_id)
+        except Exception:
+            continue
+        for edge in edges:
+            if edge.from_id in id_set and edge.to_id in id_set:
+                key = (edge.from_id, edge.to_id, edge.kind.value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    store.update_edge_weight(
+                        edge.from_id, edge.to_id, edge.kind.value,
+                        min(1.0, edge.weight + step),
+                    )
+                except Exception as e:
+                    logger.debug("Edge nudge failed for %s→%s: %s",
+                                 edge.from_id, edge.to_id, e)
+
+
+# ── Entry points ───────────────────────────────────────────────────────
+
+def inject_hot_context(store: Store, entity_id: Optional[str] = None) -> str:
+    """Format hot cache as context string for prompt injection.
+
+    Returns the rendered hot cache context, or empty string if cache is empty.
+    Builds a fresh cache if none exists yet.
+    """
+    cache_entity_id = entity_id or "__global__"
+    cached = store.get_hot_cache(cache_entity_id)
+
+    if cached is None or not cached.rendered:
+        # Build fresh cache
+        cache = update_hot_cache(store, entity_id=entity_id)
+        return cache.rendered
+
+    return cached.rendered
+
+
+def recall(
+    query: str,
+    store: Store,
+    entity_ids: Optional[list[str]] = None,
+    limit: Optional[int] = None,
+    as_of: Optional[datetime] = None,
+) -> list[MemoryRecord]:
+    """Main recall function — deep recall with hot cache update.
+
+    Runs deep_recall and then refreshes the hot cache to reflect
+    the updated recall counts. Temporal queries (`as_of`) touch nothing,
+    so no cache refresh happens for them.
+
+    Args:
+        query: Natural language query.
+        store: The LanceDB store.
+        entity_ids: Optional entity filter.
+        limit: Max memories to return.
+        as_of: Optional timestamp for temporal recall.
+
+    Returns:
+        List of MemoryRecord ranked by relevance.
+    """
+    results = deep_recall(query, store, entity_ids=entity_ids, limit=limit, as_of=as_of)
+
+    if as_of is None:
+        # Refresh hot cache after recall (recall_count has changed)
+        try:
+            update_hot_cache(store, entity_id=entity_ids[0] if entity_ids else None)
+        except Exception as e:
+            logger.warning("Hot cache update after recall failed: %s", e)
+
+    return results
+
+
+def format_memories_for_prompt(memories: list[MemoryRecord]) -> str:
+    """Format memories as readable context string for prompt injection.
+
+    Produces a clean, compact format suitable for system prompt inclusion.
+    Each memory is prefixed with its network tag (W=world, E=experience,
+    O=opinion/observation).
+    """
+    if not memories:
+        return ""
+
+    lines = ["[Memories]"]
+    for mem in memories:
+        # Prefix with network tag for context
+        tag = mem.network.value[0].upper()  # W/E/O
+        lines.append(f"- [{tag}] {mem.text}")
+
+    return "\n".join(lines)
