@@ -105,6 +105,10 @@ _AUX_ENV_MODEL = os.environ.get("GALAXYMEM_AUX_MODEL", "kilo-auto/free")
 
 def _load_aux_defaults(hermes_home: Optional[str] = None) -> dict:
     """Load auxiliary LLM defaults from galaxymem.json; fall back to env/hardcoded."""
+    # Read env at call time (not import time) so vars set after startup apply;
+    # the module-level constants only supply the final hardcoded fallback.
+    env_provider = os.environ.get("GALAXYMEM_AUX_PROVIDER", _AUX_ENV_PROVIDER)
+    env_model = os.environ.get("GALAXYMEM_AUX_MODEL", _AUX_ENV_MODEL)
     if hermes_home:
         config_path = Path(hermes_home) / "galaxymem.json"
         if config_path.exists():
@@ -113,13 +117,13 @@ def _load_aux_defaults(hermes_home: Optional[str] = None) -> dict:
                 aux = data.get("aux", {})
                 if isinstance(aux, dict):
                     return {
-                        "provider": aux.get("provider", _AUX_ENV_PROVIDER),
-                        "model": aux.get("model", _AUX_ENV_MODEL),
+                        "provider": aux.get("provider", env_provider),
+                        "model": aux.get("model", env_model),
                     }
             except Exception as e:
                 logger.warning(
                     "Failed to load aux defaults from galaxymem.json: %s", e)
-    return {"provider": _AUX_ENV_PROVIDER, "model": _AUX_ENV_MODEL}
+    return {"provider": env_provider, "model": env_model}
 
 
 class _LLMClientAdapter:

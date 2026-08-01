@@ -548,25 +548,25 @@ class TestViewerImports:
         import fastapi
         from galaxymem.viewer.app import (
             _check_rate_limit,
-            _get_viewer_token,
             app,
-            bearer,
-            require_auth,
+            run_viewer,
         )
         assert app is not None
-        assert bearer is not None
         assert callable(_check_rate_limit)
-        assert callable(_get_viewer_token)
-        assert callable(require_auth)
+        assert callable(run_viewer)
 
     def test_viewer_has_health_route(self):
         from galaxymem.viewer.app import app
         assert any(r.path == "/health" for r in app.routes), "missing /health route"
 
-    def test_viewer_route_auth(self):
-        """All API routes should require auth."""
+    def test_viewer_routes_public(self):
+        """Viewer is a local-only tool — API routes must NOT require auth.
+
+        (Decision: token auth was stripped on 2026-08-01; the tool binds to
+        127.0.0.1 and is meant for local inspection only.)
+        """
         from galaxymem.viewer.app import app
-        auth_routes = [
+        public_routes = [
             "/api/stats", "/api/memories", "/api/memories/{memory_id}",
             "/api/entities", "/api/entities/{entity_id}",
             "/api/graph", "/api/graph/similarity", "/api/graph/entity/{entity_id}",
@@ -574,10 +574,9 @@ class TestViewerImports:
             "/as-of/{timestamp}",
         ]
         for r in app.routes:
-            if r.path in auth_routes:
-                # Check it has the auth dependency
-                assert any("require_auth" in str(d) for d in getattr(r, 'dependencies', [])), \
-                    f"Route {r.path} missing auth"
+            if r.path in public_routes:
+                assert not any("require_auth" in str(d) for d in getattr(r, 'dependencies', [])), \
+                    f"Route {r.path} unexpectedly requires auth"
 
     def test_rate_limit_function(self):
         """Rate limiter tracks calls per ip."""
