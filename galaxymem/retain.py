@@ -355,6 +355,7 @@ For each turn, extract zero or more memories. Each memory must have:
 - network: One of "world" (objective facts), "experience" (events/actions), "opinion" (preferences/views), "observation" (patterns/insights)
 - entity_labels: Who or what the memory is ABOUT — NOT who said it. A fact Sarah states about the Hermes project is filed under ["Hermes"], not ["Sarah"]. Use short names. Leave empty if it is general knowledge about no tracked person/project.
 - canonical_key: A canonicalized fact key used for deduplication AND consistency across sessions. Format: "subject|predicate|object" (lowercase, no spaces in each component, use hyphens), e.g. "user|name-is|umar", "hermes|uses|lancedb", "umar|works-on|galaxymem". Different phrasings of the same fact MUST produce the SAME canonical_key. This is the consistency layer.
+- memory_ids: An array of the flag_id(s) this memory was inferred from (see the (flag_id: ...) markers on each numbered turn). Use only flag_ids shown in the input. Omit or use [] if no specific flag applies.
 
 Classify network conservatively: when unsure between "world" and "opinion", choose "opinion" — it is the revisable bucket, and misfiling an inference as a world fact is the worse error.
 
@@ -372,7 +373,8 @@ Return your answer as a JSON array of objects. Each object has:
   "text": "...",
   "network": "world|experience|opinion|observation",
   "entity_labels": ["label1", "label2"],
-  "canonical_key": "subject|predicate|object"  // optional but HIGHLY encouraged
+  "canonical_key": "subject|predicate|object",  // optional but HIGHLY encouraged
+  "memory_ids": ["flag_id_1"]  // optional; flag_id(s) this memory came from
 }
 
 If a turn contains no extractable memories, return an empty array [].
@@ -436,7 +438,9 @@ def _build_extraction_prompt(flags: list[FlagRecord]) -> str:
     lines = []
     for i, flag in enumerate(flags, 1):
         sanitized = _sanitize_turn_text(flag.turn_text)
-        lines.append(f"[{i}] (flag: {flag.flag_reason}) \"{sanitized}\"")
+        lines.append(
+            f"[{i}] (flag: {flag.flag_reason}) (flag_id: {flag.id}) \"{sanitized}\""
+        )
     flags_text = "\n".join(lines)
     return EXTRACTION_USER_TEMPLATE.format(flags_text=flags_text)
 
@@ -590,6 +594,9 @@ def _process_batch(
         store, batch[0].platform, batch[0].speaker_external_id,
     )
 
+    # Map flag ids → records so extracted memories can cite their true sources.
+    flag_by_id = {f.id: f for f in batch}
+
     # Build prompt and call LLM
     prompt = _build_extraction_prompt(batch)
     full_prompt = EXTRACTION_SYSTEM_PROMPT + "\n\n" + prompt
@@ -628,6 +635,17 @@ def _process_batch(
             if _is_suspicious_memory(mem_text):
                 continue
 
+            # Source flags: prefer the flag_id(s) the LLM cited for this
+            # memory; only trust ids that are actually in this batch. Fall
+            # back to the batch leader so provenance is never empty.
+            raw_source_ids = item.get("memory_ids") or []
+            if not isinstance(raw_source_ids, list):
+                raw_source_ids = []
+            item_source_ids = [fid for fid in raw_source_ids if fid in flag_by_id]
+            if not item_source_ids:
+                item_source_ids = [batch[0].id]
+            source_flag = flag_by_id.get(item_source_ids[0], batch[0])
+
             # Validate network
             network_str = item.get("network", "world")
             try:
@@ -661,7 +679,7 @@ def _process_batch(
                     # entity_ids, we extend them.
                     merged_source_ids = list(dict.fromkeys(
                         [*(existing_by_key.source_memory_ids or []),
-                         batch[0].id]
+                         *item_source_ids]
                     ))
                     store.update_memory_field(
                         existing_by_key.id,
@@ -676,7 +694,7 @@ def _process_batch(
                         existing_by_key.id,
                         network=network.value if hasattr(network, 'value') else network,
                         last_recalled_at=datetime.now(timezone.utc).isoformat(),
-                        flagged_source=batch[0].flag_reason,
+                        flagged_source=source_flag.flag_reason,
                     )
                     logger.debug(
                         "Canonized memory merge: %s → %s",
@@ -699,12 +717,12 @@ def _process_batch(
                 text=mem_text,
                 network=network,
                 entity_ids=entity_ids,
-                source_memory_ids=[batch[0].id],
+                source_memory_ids=item_source_ids,
                 status=MemoryStatus.active,
                 source_session_id=batch[0].session_id,
                 source_platform=batch[0].platform,
                 speaker_entity_id=speaker_entity_id,
-                flagged_source=batch[0].flag_reason,
+                flagged_source=source_flag.flag_reason,
                 canonical_key=canonical_key,
             )
             store.add_memory(memory)

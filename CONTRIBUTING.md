@@ -16,8 +16,9 @@ pip install -e ".[dev,viewer]"
 pytest galaxymem/tests/ -v
 ```
 
-All 128 tests must pass. The test suite mirrors the module structure — see
-`galaxymem/tests/` for coverage breakdown.
+The full suite must pass (currently ~229 tests; the exact count grows as tests
+are added). The test suite mirrors the module structure — see `galaxymem/tests/`
+for coverage breakdown.
 
 ## Code style
 
@@ -45,7 +46,7 @@ Read **[ARCHITECTURE.md](ARCHITECTURE.md)** before making changes. Key rules:
 
 1. Fork the repo and create a feature branch
 2. Write tests for new behavior
-3. Ensure `pytest galaxymem/tests/ -v` passes (128+ tests)
+3. Ensure `pytest galaxymem/tests/ -v` passes (full suite; currently ~229 tests)
 4. Keep changes surgical — one concern per PR
 5. Reference any issues in the commit message
 

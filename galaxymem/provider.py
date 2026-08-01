@@ -1056,7 +1056,16 @@ class GalaxyMemProvider(MemoryProvider):
 
         limit = min(int(args.get("limit", 8)), 50)
 
-        entity_ids = self._resolve_entity_args(args.get("entities") or [])
+        raw_entities = [e for e in (args.get("entities") or []) if (e or "").strip()]
+        entity_ids = self._resolve_entity_args(raw_entities)
+        if raw_entities and not entity_ids:
+            # Fail-closed: if the caller named entities but none resolved, do NOT
+            # silently fall back to an unscoped full-store search (D8 scoping).
+            return tool_error(
+                "None of the given entity labels matched a tracked entity; "
+                "refusing to run an unscoped recall. Check the names, or omit "
+                "'entities' to search the whole memory store."
+            )
 
         as_of = None
         as_of_raw = (args.get("as_of") or "").strip()
@@ -1473,8 +1482,8 @@ class GalaxyMemProvider(MemoryProvider):
             # Identity links
             export_data["identity_links"] = [
                 link.model_dump(mode="json")
-                for link in self._store._identities.search().to_pandas().itertuples()
-            ] if False else []  # safer to iterate entities
+                for link in self._store.list_identity_links()
+            ]
             # Promotion queue
             export_data["promotion_queue"] = [
                 q.model_dump(mode="json")
