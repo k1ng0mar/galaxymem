@@ -26,19 +26,6 @@ _reranker_lock = threading.Lock()
 _reranker_failed = False  # sticky flag: once it's failed, don't retry each call
 
 
-class _NullReranker:
-    """Fallback when the real cross-encoder can't load — identity passthrough."""
-    def score(self, pairs: list[tuple[str, str]]) -> list[float]:
-        # Score = number of query terms present in the memory (cheap lexical fallback)
-        scores = []
-        for query, memory in pairs:
-            qterms = set(query.lower().split())
-            mterms = set(memory.lower().split())
-            overlap = len(qterms & mterms) / max(1, len(qterms))
-            scores.append(overlap)
-        return scores
-
-
 def _load_reranker():
     """Lazy-load the cross-encoder model. Returns None if unavailable."""
     global _reranker, _reranker_failed
@@ -100,7 +87,7 @@ def rerank(
             raise RuntimeError(
                 f"Reranker model '{cfg.RERANKER_MODEL}' unavailable and fallback disabled"
             )
-        return memories_with_scores
+        return memories_with_scores[:top_k]
 
     # Build (query, memory_text) pairs for scoring
     pairs = [(query, m[0].text) for m in memories_with_scores]

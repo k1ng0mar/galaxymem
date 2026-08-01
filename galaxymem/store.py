@@ -40,6 +40,26 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+
+def _table_row_count(table: LanceTable) -> int:
+    """Return the number of rows in a LanceDB table across supported versions.
+
+    LanceDB 0.34 exposes count_rows(); older versions have no working count()
+    on the sync Table, so fall back to a full scan.
+    """
+    try:
+        return table.count_rows()
+    except Exception:
+        pass
+    try:
+        count = table.count()
+        if isinstance(count, int):
+            return count
+    except Exception:
+        pass
+    return len(table.search().to_pandas())
+
+
 # ── Embedding function ──────────────────────────────────────────────────
 
 _embed_fn = None
@@ -447,25 +467,18 @@ class Store:
         """Raise RuntimeError if the DB size limits (config) are exceeded."""
         from . import config as cfg
         if cfg.MAX_MEMORIES > 0:
-            try:
-                count = self._memories.count()
-            except Exception:
-                count = len(self._memories.search().limit(cfg.MAX_MEMORIES + 1).to_pandas())
+            count = _table_row_count(self._memories)
             if count >= cfg.MAX_MEMORIES:
                 raise RuntimeError(
                     f"Memory limit reached ({count} >= {cfg.MAX_MEMORIES}). "
                     f"Archive or export older memories before adding more."
                 )
         if cfg.MAX_EDGES > 0:
-            try:
-                count = self._edges.count()
-            except Exception:
-                pass  # best-effort
-            else:
-                if count >= cfg.MAX_EDGES:
-                    raise RuntimeError(
-                        f"Edge limit reached ({count} >= {cfg.MAX_EDGES})."
-                    )
+            count = _table_row_count(self._edges)
+            if count >= cfg.MAX_EDGES:
+                raise RuntimeError(
+                    f"Edge limit reached ({count} >= {cfg.MAX_EDGES})."
+                )
 
     def add_memory(self, memory: MemoryRecord) -> str:
         """Insert a memory. Returns its id."""
@@ -786,6 +799,20 @@ class Store:
             for _, row in df.iterrows()
         ]
 
+    def list_identity_links(self) -> list[IdentityLink]:
+        """List all identity links."""
+        df = self._identities.search().to_pandas()
+        return [
+            IdentityLink(
+                platform=row["platform"],
+                external_id=row["external_id"],
+                entity_id=row["entity_id"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                created_by=LinkMethod(row["created_by"]),
+            )
+            for _, row in df.iterrows()
+        ]
+
     def repoint_identity_links(self, old_entity_id: str, new_entity_id: str) -> int:
         """Move all identity links from old entity to new entity."""
         self._identities.update(
@@ -980,19 +1007,11 @@ class Store:
         breakdowns from the (small) metadata slices we actually need.
         """
         # Use DB-level counting; only load what's needed for the breakdowns
-        try:
-            mem_count = self._memories.count()
-        except Exception:
-            # Fallback if count() not available
-            mem_count = len(self._memories.search().limit(1).to_pandas()) if False else -1
+        mem_count = _table_row_count(self._memories)
 
         ent_df = self._entities.search().to_pandas()  # small table
         flag_count = self.unprocessed_flag_count()
-        edge_count = 0
-        try:
-            edge_count = self._edges.count()
-        except Exception:
-            pass  # count may not be available in older lancedb
+        edge_count = _table_row_count(self._edges)
 
         # For network/status breakdowns on mem_df we need the actual rows.
         # If the DB is huge this still loads everything but at least total

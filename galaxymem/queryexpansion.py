@@ -15,8 +15,6 @@ import logging
 import re
 from typing import Optional
 
-from . import config as cfg
-
 logger = logging.getLogger(__name__)
 
 
@@ -63,24 +61,10 @@ def should_expand(query: str, entity_ids: Optional[list[str]] = None) -> bool:
     extra broadening — the entity filter is doing the relevance work.
     Queries that are already long don't need expansion either.
     """
-    # Entity-scoped queries: no broadening needed
     if entity_ids:
         return False
-    # Single-word queries: too vague for the LLM to improve meaningfully
     if len(query.split()) < 2:
         return False
-    # Already long/detailed: diminishing returns
     if len(query) > 120:
         return False
-    # clean "get me the" fillers
-    q = query.strip()
-    if re.match(r"^(get|show|find|tell me|what|list|search|recall|remember)\b", q, re.IGNORECASE):
-        return True  # these need expansion to work with actual content
-    return True  # default: expand
-
-
-def update_config_from_env() -> None:
-    """Reload expansion config from env vars."""
-    cfg.QUERY_EXPANSION_LLM = os.environ.get(
-        "GALAXYMEM_QUERY_EXPANSION", "true"
-    ).lower() not in ("false", "0", "no", "off")
+    return True

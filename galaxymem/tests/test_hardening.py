@@ -30,6 +30,14 @@ try:
 except ImportError:
     HAS_FASTAPI = False
 
+# galaxymem.provider imports Hermes internals (agent.* / tools.*); those
+# modules only exist inside a Hermes Agent runtime, not standalone.
+try:
+    from galaxymem.provider import _load_aux_defaults  # noqa: F401
+    HAS_HERMES_RUNTIME = True
+except ImportError:
+    HAS_HERMES_RUNTIME = False
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from galaxymem.config import (
@@ -200,7 +208,9 @@ Next line: "important meeting"'''
         prompt = _build_extraction_prompt(flags)
         # Both flags should appear in the prompt
         assert "flag: explicit_memory_marker" in prompt
-        assert "flag-2" not in prompt  # flag IDs don't appear, only flag reasons
+        # Flag IDs appear so the LLM can cite the exact source flag(s)
+        # (used for per-memory source attribution)
+        assert "flag_id: flag-2" in prompt
         # The injected quotes/text should be JSON-escaped
         assert '\\"' in prompt  # quotes escaped
 
@@ -261,13 +271,13 @@ class _FakeStore:
 
     def __init__(self, mem_count=0, ent_count=0, flag_count=0):
         self._memories = MagicMock()
-        self._memories.count.return_value = mem_count
+        self._memories.count_rows.return_value = mem_count
         self._entities = MagicMock()
-        self._entities.count.return_value = ent_count
+        self._entities.count_rows.return_value = ent_count
         self._flags = MagicMock()
         self._flags.search.return_value = MagicMock()  # enough for unprocessed_flags
         self._edges = MagicMock()
-        self._edges.count.return_value = 0
+        self._edges.count_rows.return_value = 0
         self._max_memories = mem_count
         self._max_entities = ent_count
         self._max_flags = flag_count
@@ -588,21 +598,27 @@ class TestViewerImports:
 # ── aux defaults loading ──────────────────────────────────────────────────────
 
 class TestAuxDefaults:
-    """Validate _load_aux_defaults behaviour."""
+    """Validate _load_aux_defaults behaviour (requires Hermes runtime)."""
 
+    @pytest.mark.skipif(
+        not HAS_HERMES_RUNTIME,
+        reason="galaxymem.provider imports Hermes agent.* modules",
+    )
     def test_load_aux_defaults_env_fallback(self, tmp_path):
         """Without galaxymem.json, falls back to env vars."""
         os.environ["GALAXYMEM_AUX_PROVIDER"] = "custom:test"
         os.environ["GALAXYMEM_AUX_MODEL"] = "test-model/free"
-        from galaxymem.provider import _load_aux_defaults
         result = _load_aux_defaults(None)
         assert result["provider"] == "custom:test"
         assert result["model"] == "test-model/free"
         del os.environ["GALAXYMEM_AUX_PROVIDER"]
         del os.environ["GALAXYMEM_AUX_MODEL"]
 
+    @pytest.mark.skipif(
+        not HAS_HERMES_RUNTIME,
+        reason="galaxymem.provider imports Hermes agent.* modules",
+    )
     def test_load_aux_defaults_hardcoded_fallback(self):
-        from galaxymem.provider import _load_aux_defaults
         # With no env vars and no hermes_home, use hardcoded default
         result = _load_aux_defaults(None)
         assert result["provider"]  # non-empty

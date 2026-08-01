@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
-import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
 try:
@@ -31,65 +29,6 @@ except ImportError:
     from galaxymem.models import MemoryStatus
 
 logger = logging.getLogger(__name__)
-
-# ── Auth ─────────────────────────────────────────────────────────────────────
-
-# Bearer token for the viewer API. Loaded from galaxymem.json, env var, or
-# auto-generated on first run and persisted to galaxymem.json.
-_VIEWER_TOKEN: Optional[str] = None
-
-
-def _get_viewer_token() -> str:
-    """Return the current viewer token. Loads from config or generates one."""
-    global _VIEWER_TOKEN
-    if _VIEWER_TOKEN is not None:
-        return _VIEWER_TOKEN
-
-    # Priority: env var → galaxymem.json → generate
-    token = os.environ.get("GALAXYMEM_VIEWER_TOKEN")
-    if token:
-        _VIEWER_TOKEN = token
-        return _VIEWER_TOKEN
-
-    # Try to load from galaxymem.json
-    config_path = Path.home() / ".galaxymem" / "galaxymem.json"
-    if config_path.exists():
-        try:
-            data = __import__("json").loads(config_path.read_text(encoding="utf-8"))
-            tok = data.get("viewer", {}).get("token")
-            if tok:
-                _VIEWER_TOKEN = tok
-                return _VIEWER_TOKEN
-        except Exception:
-            pass
-
-    # Generate a new one and persist it
-    token = secrets.token_urlsafe(32)
-    _VIEWER_TOKEN = token
-    try:
-        data = {}
-        if config_path.exists():
-            data = __import__("json").loads(config_path.read_text(encoding="utf-8"))
-        data.setdefault("viewer", {})["token"] = token
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(__import__("json").dumps(data, indent=2), mode=0o600)
-        logger.info("Generated new viewer token; persisted to %s", config_path)
-    except Exception as e:
-        logger.warning("Could not persist viewer token: %s", e)
-
-    logger.info("Viewer API token: %s", token)
-    return token
-
-
-bearer = HTTPBearer(auto_error=False)
-
-
-def require_auth(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -> None:
-    """FastAPI dependency that enforces bearer token auth on API routes."""
-    token = _get_viewer_token()
-    if credentials is None or credentials.credentials != token:
-        raise HTTPException(status_code=401, detail="Unauthorized. Set GALAXYMEM_VIEWER_TOKEN env var or check galaxymem.json for the token.")
-
 
 # ── Rate limiting (in-memory, simple) ───────────────────────────────────────
 
@@ -186,7 +125,7 @@ def health():
         )
 
 
-@app.get("/api/stats", dependencies=[Depends(require_auth)])
+@app.get("/api/stats")
 def get_stats(request: Request):
     """Get memory store statistics."""
     _check_rate_limit(_get_client_ip(request))
@@ -198,7 +137,7 @@ def get_stats(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/memories", dependencies=[Depends(require_auth)])
+@app.get("/api/memories")
 def list_memories(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -242,7 +181,7 @@ def list_memories(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/memories/{memory_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/memories/{memory_id}")
 def get_memory(request: Request, memory_id: str):
     """Get a single memory with its edges."""
     try:
@@ -264,7 +203,7 @@ def get_memory(request: Request, memory_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/entities", dependencies=[Depends(require_auth)])
+@app.get("/api/entities")
 def list_entities(request: Request):
     """List all entities."""
     _check_rate_limit(_get_client_ip(request))
@@ -277,7 +216,7 @@ def list_entities(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/entities/{entity_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/entities/{entity_id}")
 def get_entity(request: Request, entity_id: str):
     """Get entity with its memories."""
     _check_rate_limit(_get_client_ip(request))
@@ -301,7 +240,7 @@ def get_entity(request: Request, entity_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/graph", dependencies=[Depends(require_auth)])
+@app.get("/api/graph")
 def get_graph(
     request: Request,
     limit: int = Query(200, ge=1, le=1000),
@@ -389,10 +328,10 @@ def get_graph(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/graph/similarity", dependencies=[Depends(require_auth)])
+@app.get("/api/graph/similarity")
 def get_similarity_graph(
     request: Request,
-    limit: int = Query(100, ge=1, le=50),  # hard cap to prevent N+1 DoS
+    limit: int = Query(50, ge=1, le=50),  # hard cap to prevent N+1 DoS
     threshold: float = Query(0.5, ge=0.0, le=1.0),
     network: Optional[str] = None,
 ):
@@ -477,7 +416,7 @@ def get_similarity_graph(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/graph/entity/{entity_id}", dependencies=[Depends(require_auth)])
+@app.get("/api/graph/entity/{entity_id}")
 def get_entity_graph(request: Request, entity_id: str):
     """Get subgraph centered on an entity."""
     _check_rate_limit(_get_client_ip(request))
@@ -580,7 +519,7 @@ def _compute_brightness(memory) -> float:
     return max(cfg.BRIGHTNESS_FLOOR, brightness)
 
 
-@app.get("/graph", dependencies=[Depends(require_auth)])
+@app.get("/graph")
 def get_spec_graph(
     request: Request,
     limit: Optional[int] = Query(None, ge=1, le=10000),
@@ -677,7 +616,7 @@ def get_spec_graph(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/entity/{entity_id}", dependencies=[Depends(require_auth)])
+@app.get("/entity/{entity_id}")
 def get_spec_entity(request: Request, entity_id: str):
     """Spec-contract entity detail endpoint."""
     _check_rate_limit(_get_client_ip(request))
@@ -706,7 +645,7 @@ def get_spec_entity(request: Request, entity_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/memory/{memory_id}", dependencies=[Depends(require_auth)])
+@app.get("/memory/{memory_id}")
 def get_spec_memory(request: Request, memory_id: str):
     """Spec-contract memory detail endpoint."""
     _check_rate_limit(_get_client_ip(request))
@@ -732,7 +671,7 @@ def get_spec_memory(request: Request, memory_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/as-of/{timestamp}", dependencies=[Depends(require_auth)])
+@app.get("/as-of/{timestamp}")
 def get_as_of(timestamp: str):
     """Time-travel: return the graph as it was at a given timestamp.
 
@@ -798,7 +737,7 @@ def get_as_of(timestamp: str):
         # Build edges (same as /graph but include superseded)
         edges = []
         seen_edges = set()
-        all_node_ids = memory_ids | entity_ids
+        all_node_ids = {m.id for m in memories} | entity_ids
 
         for m in memories:
             mem_edges = store.get_edges_for_memory(m.id)

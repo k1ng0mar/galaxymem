@@ -171,7 +171,7 @@ galaxymem/                 # the Python package (pip-installable)
 ├── viewer/                # Optional FastAPI + JS galaxy-graph viewer ([viewer] extra)
 │   ├── app.py
 │   └── static/
-└── tests/                 # 128 tests (full coverage)
+└── tests/                 # full coverage (~229 tests; count grows as tests are added)
 
 # Plugin glue (lives at the plugin root, not inside the package):
 __init__.py                # Hermes plugin entry: register(GalaxyMemProvider)
