@@ -355,8 +355,6 @@ def deep_recall(
 
         # Step 2: RRF fusion
         rrf_scores = _fuse_rrf(vector_results, keyword_results)
-        if not rrf_scores:
-            return []
 
         candidates: dict[str, MemoryRecord] = {}
         for mem, _ in vector_results:
@@ -364,10 +362,50 @@ def deep_recall(
         for mem, _ in keyword_results:
             candidates.setdefault(mem.id, mem)
 
-        # Step 3: decay boost — fused score × (0.5 + 0.5 × brightness)
+        # Step 2b: temporal arm — if the query names a time window, fetch
+        # memories created in that window and give them an RRF-ranked
+        # contribution. Their decay boost is computed against the window
+        # end instead of now, so brightness doesn't bury historical facts.
+        temporal_range = None
+        if cfg.TEMPORAL_ARM_ENABLED:
+            try:
+                from .temporal_parse import parse_temporal_range
+
+                temporal_range = parse_temporal_range(query)
+            except Exception as e:
+                logger.debug("temporal parse failed: %s", e)
+        if temporal_range is not None:
+            t_start, t_end = temporal_range
+            try:
+                window = search_store.list_memories(
+                    status=MemoryStatus.active,
+                    since=t_start,
+                    until=t_end,
+                    limit=cfg.RECALL_TEMPORAL_K,
+                )
+            except Exception as e:
+                logger.warning("temporal arm fetch failed: %s", e)
+                window = []
+            # Rank the window by recency within the window and fuse.
+            window_sorted = sorted(window, key=lambda m: m.created_at, reverse=True)
+            for rank, mem in enumerate(window_sorted, start=1):
+                rrf_scores[mem.id] += rrf_score(rank)
+                candidates.setdefault(mem.id, mem)
+
+        if not rrf_scores:
+            return []
+
+        # Step 3: decay boost — fused score × (0.5 + 0.5 × brightness).
+        # Temporal-arm hits get brightness computed against the window end
+        # (not now), so a July fact queried as "in july" isn't punished
+        # for being old — inside its window it's fresh.
         now = datetime.now(timezone.utc)
+        if temporal_range is not None:
+            brightness_now = min(temporal_range[1], now)
+        else:
+            brightness_now = now
         final_scores: dict[str, float] = {
-            mem_id: rrf_scores[mem_id] * (0.5 + 0.5 * _brightness(candidates[mem_id], now))
+            mem_id: rrf_scores[mem_id] * (0.5 + 0.5 * _brightness(candidates[mem_id], brightness_now))
             for mem_id in rrf_scores
         }
 
