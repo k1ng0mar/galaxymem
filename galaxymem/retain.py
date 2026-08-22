@@ -539,6 +539,20 @@ def process_pending_flags(
     if not flags:
         return 0
 
+    # Park poison batches: flags that already failed PASS2_MAX_ATTEMPTS
+    # times stay unprocessed but are never retried (their extraction
+    # reliably crashes the batch — retrying them forever would block the
+    # queue and re-send the same toxic payload to the LLM every trigger).
+    parked = [f for f in flags if f.attempt_count >= cfg.PASS2_MAX_ATTEMPTS]
+    if parked:
+        logger.warning(
+            "Pass 2: skipping %d parked flag(s) that failed %d attempts",
+            len(parked), cfg.PASS2_MAX_ATTEMPTS,
+        )
+    flags = [f for f in flags if f.attempt_count < cfg.PASS2_MAX_ATTEMPTS]
+    if not flags:
+        return 0
+
     total_memories_created = 0
     affected_entities: set[str] = set()
 
@@ -565,6 +579,7 @@ def process_pending_flags(
                 "Pass 2: batch of %d flags left unprocessed for next trigger",
                 len(batch),
             )
+            store.increment_flag_attempts(batch_flag_ids)
             continue
 
         total_memories_created += memories_created

@@ -275,6 +275,7 @@ def _to_flag_row(f: FlagRecord) -> dict:
         "turn_text": f.turn_text,
         "flag_reason": f.flag_reason,
         "processed": f.processed,
+        "attempt_count": getattr(f, "attempt_count", 0),
         "created_at": f.created_at.isoformat() if isinstance(f.created_at, datetime) else f.created_at,
     }
 
@@ -958,6 +959,14 @@ class Store:
         for fid in flag_ids:
             self._flags.update(where=f'id = "{_esc(fid)}"', values={"processed": True})
 
+    def increment_flag_attempts(self, flag_ids: list[str]) -> None:
+        """Bump attempt_count on flags whose extraction batch just failed."""
+        for fid in flag_ids:
+            self._flags.update(
+                where=f'id = "{_esc(fid)}"',
+                values_sql={"attempt_count": "attempt_count + 1"},
+            )
+
     def consume_flags(self, session_id: str) -> list[FlagRecord]:
         """Get and mark all unprocessed flags for a session."""
         flags = [f for f in self.unprocessed_flags(session_id) if f.session_id == session_id]
@@ -1106,5 +1115,6 @@ def _from_flag(row) -> FlagRecord:
         turn_text=row["turn_text"],
         flag_reason=row["flag_reason"],
         processed=bool(row["processed"]),
+        attempt_count=int(row.get("attempt_count", 0) or 0),
         created_at=datetime.fromisoformat(row["created_at"]),
     )

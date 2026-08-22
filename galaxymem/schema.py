@@ -77,6 +77,7 @@ class FlagsTable(LanceModel):
     turn_text: str
     flag_reason: str
     processed: bool = False
+    attempt_count: int = 0
     created_at: str
 
 
