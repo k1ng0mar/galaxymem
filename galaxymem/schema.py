@@ -35,6 +35,8 @@ class MemoriesTable(LanceModel):
     promoted_to: Optional[str] = None
     flagged_source: Optional[str] = None
     canonical_key: Optional[str] = None  # subject|predicate|object for structured facts
+    proof_count: int = 0  # provenance strength for derived records (opinions)
+    history_json: Optional[str] = None  # JSON-encoded [{at, action, sources}]
 
 
 class EntitiesTable(LanceModel):

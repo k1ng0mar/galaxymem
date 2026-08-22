@@ -586,6 +586,7 @@ def _form_opinions_for_entity(store, llm_client: LLMClient, entity_id: str,
             id=_ulid(), text=text, network=Network.opinion,
             entity_ids=[entity_id], source_memory_ids=source_ids,
             status=MemoryStatus.active,
+            proof_count=len(source_ids),
         )
         store.add_memory(opinion)
         for sid in source_ids:
@@ -625,7 +626,28 @@ def _merge_into_existing_opinion(store, entity_id: str, text: str,
         if score < score_threshold:
             continue
         combined = list(dict.fromkeys([*candidate.source_memory_ids, *source_ids]))
-        store.update_memory_field(candidate.id, source_memory_ids=combined)
+        # Provenance: proof_count tracks distinct supporting sources; the
+        # merge event is appended to history for auditability.
+        new_proof = len(combined)
+        import json as _json
+
+        try:
+            history = _json.loads(candidate.history_json or "[]")
+            if not isinstance(history, list):
+                history = []
+        except (ValueError, TypeError):
+            history = []
+        history.append({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "action": "merge",
+            "sources": list(source_ids),
+        })
+        store.update_memory_field(
+            candidate.id,
+            source_memory_ids=combined,
+            proof_count=new_proof,
+            history_json=_json.dumps(history),
+        )
         for sid in source_ids:
             if sid not in candidate.source_memory_ids:
                 store.add_edge(EdgeRecord(from_id=sid, to_id=candidate.id,
