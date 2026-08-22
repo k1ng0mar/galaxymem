@@ -36,6 +36,12 @@ ACTIVATION_MIN_WEIGHT = float(os.environ.get("GALAXYMEM_ACTIVATION_MIN_WEIGHT", 
 ACTIVATION_DAMPING = float(os.environ.get("GALAXYMEM_ACTIVATION_DAMPING", "0.5"))
 RECALL_DEFAULT_K = int(os.environ.get("GALAXYMEM_RECALL_DEFAULT_K", "8"))
 RECALL_SEARCH_K = int(os.environ.get("GALAXYMEM_RECALL_SEARCH_K", "25"))
+# Temporal arm: parse date expressions from the query and fuse a
+# window-ranked retrieval signal into RRF (hindsight-inspired).
+TEMPORAL_ARM_ENABLED = os.environ.get(
+    "GALAXYMEM_TEMPORAL_ARM", "true"
+).lower() not in ("false", "0", "no", "off")
+RECALL_TEMPORAL_K = int(os.environ.get("GALAXYMEM_RECALL_TEMPORAL_K", "25"))
 
 # Reflect
 REFLECT_CRON = os.environ.get("GALAXYMEM_REFLECT_CRON", "30 3 * * *")

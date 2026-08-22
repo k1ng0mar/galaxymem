@@ -599,6 +599,7 @@ class Store:
         status: Optional[MemoryStatus | str] = None,
         entity_ids: Optional[list[str]] = None,
         since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
         limit: Optional[int] = None,
     ) -> list[MemoryRecord]:
         """List memories with optional filters.
@@ -625,6 +626,9 @@ class Store:
         if since is not None:
             since_iso = since.isoformat() if isinstance(since, datetime) else since
             clauses.append(f'created_at > "{since_iso}"')
+        if until is not None:
+            until_iso = until.isoformat() if isinstance(until, datetime) else until
+            clauses.append(f'created_at <= "{until_iso}"')
 
         where_clause = " AND ".join(clauses) if clauses else None
         q = self._memories.search()
