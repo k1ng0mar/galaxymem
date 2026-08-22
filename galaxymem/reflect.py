@@ -158,6 +158,48 @@ def _state_path(store) -> Path:
     return Path(store.db_path) / "reflect_state.json"
 
 
+# Concurrency: only one reflection cycle per store at a time. The lock is
+# an O_CREAT|O_EXCL claim file next to reflect_state.json; a stale lock
+# (crashed holder) is stolen after _LOCK_STALE_SECS.
+_LOCK_STALE_SECS = 1800.0  # 30 minutes
+
+
+def _lock_path(store) -> Path:
+    return Path(store.db_path) / "reflect.lock"
+
+
+def _acquire_reflect_lock(store) -> bool:
+    """Try to claim the reflect lock non-blockingly. True on success."""
+    import os as _os
+
+    lp = _lock_path(store)
+    # Steal a stale lock (holder crashed mid-cycle).
+    try:
+        age = time.time() - float(lp.read_text(encoding="utf-8").strip() or 0)
+        if age > _LOCK_STALE_SECS:
+            logger.warning("Stealing stale reflect lock (%.0fs old)", age)
+            lp.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+    except (ValueError, OSError):
+        logger.warning("Unreadable reflect lock file; replacing it")
+
+    try:
+        fd = _os.open(str(lp), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
+        with _os.fdopen(fd, "w") as fh:
+            fh.write(str(time.time()))
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_reflect_lock(store) -> None:
+    try:
+        _lock_path(store).unlink(missing_ok=True)
+    except OSError as e:
+        logger.debug("reflect lock release failed: %s", e)
+
+
 def get_last_reflect_at(store) -> Optional[datetime]:
     """Timestamp of the last completed reflection cycle, or None."""
     try:
@@ -200,7 +242,23 @@ def should_reflect(store) -> bool:
 # ── Main entry point ───────────────────────────────────────────────────────
 
 def run_reflection(store, llm_client: LLMClient) -> dict[str, Any]:
-    """Run one full reflection cycle. Returns a report dict."""
+    """Run one full reflection cycle. Returns a report dict.
+
+    Claims an exclusive lockfile for the duration; if another cycle is
+    already running against this store, returns {"status": "skipped"}.
+    """
+    if not _acquire_reflect_lock(store):
+        logger.info("Reflection skipped: another cycle holds the reflect lock")
+        return {"status": "skipped", "reason": "reflection already running"}
+
+    try:
+        return _run_reflection_locked(store, llm_client)
+    finally:
+        _release_reflect_lock(store)
+
+
+def _run_reflection_locked(store, llm_client: LLMClient) -> dict[str, Any]:
+    """One full reflection cycle (lock held)."""
     logger.info("Starting reflection cycle")
 
     report: dict[str, Any] = {
