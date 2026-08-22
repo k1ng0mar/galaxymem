@@ -208,6 +208,8 @@ def _from_memory(t) -> MemoryRecord:
         promoted_to=_safe_str(t["promoted_to"] if isinstance(t, dict) else t.promoted_to),
         flagged_source=_safe_str(t["flagged_source"] if isinstance(t, dict) else getattr(t, 'flagged_source', None)),
         canonical_key=_safe_str(t.get("canonical_key") if isinstance(t, dict) else getattr(t, 'canonical_key', None)),
+        proof_count=int(t.get("proof_count", 0) or 0) if isinstance(t, dict) else int(getattr(t, 'proof_count', 0) or 0),
+        history_json=_safe_str(t.get("history_json") if isinstance(t, dict) else getattr(t, 'history_json', None)),
     )
 
 
@@ -232,6 +234,8 @@ def _to_memory_row(m: MemoryRecord) -> dict:
         "promoted_to": m.promoted_to,
         "flagged_source": m.flagged_source,
         "canonical_key": m.canonical_key,
+        "proof_count": m.proof_count,
+        "history_json": m.history_json,
     }
 
 
@@ -343,6 +347,7 @@ class Store:
 
                 if name == "memories":
                     self._memories = tbl
+                    self._migrate_memories_schema(tbl)
                     # Create vector index if not already present
                     self._ensure_vector_index()
                 elif name == "entities":
@@ -355,6 +360,7 @@ class Store:
                     self._hot_cache = tbl
                 elif name == "flags":
                     self._flags = tbl
+                    self._migrate_flags_schema(tbl)
                 elif name == "promotion_queue":
                     self._promotion_queue = tbl
                 elif name == "session_summaries":
@@ -375,6 +381,38 @@ class Store:
             self._promotion_queue = None
             self._session_summaries = None
             raise
+
+    def _migrate_flags_schema(self, tbl) -> None:
+        """Add attempt_count to pre-existing flags tables (idempotent)."""
+        try:
+            existing = {f.name for f in tbl.schema}
+            if "attempt_count" not in existing:
+                import pyarrow as pa
+
+                tbl.add_columns({"attempt_count": pa.int64()})
+                logger.info("Migrated flags table: added column attempt_count")
+        except Exception as e:
+            logger.warning("flags schema migration skipped: %s", e)
+
+    def _migrate_memories_schema(self, tbl) -> None:
+        """Add columns introduced after the initial schema to existing tables.
+
+        LanceDB create_table(exist_ok=True) does NOT alter an existing
+        table's schema, so new nullable/defaulted fields need an explicit
+        add_columns pass. Safe to run on every open (idempotent).
+        """
+        try:
+            existing = {f.name for f in tbl.schema}
+            import pyarrow as pa
+
+            if "proof_count" not in existing:
+                tbl.add_columns({"proof_count": pa.int64()})
+                logger.info("Migrated memories table: added column proof_count")
+            if "history_json" not in existing:
+                tbl.add_columns({"history_json": pa.string()})
+                logger.info("Migrated memories table: added column history_json")
+        except Exception as e:
+            logger.warning("memories schema migration skipped: %s", e)
 
     def _ensure_vector_index(self):
         """Create IVF-PQ vector index on memories if not present."""

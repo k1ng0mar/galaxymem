@@ -74,6 +74,11 @@ class MemoryRecord(BaseModel):
     # the same fact extracted differently ("Umar likes X" vs "Umar prefers X")
     # maps to one canonical_key and gets merged instead of duplicated.
     canonical_key: Optional[str] = None
+    # Provenance strength for derived records (opinions): how many distinct
+    # sources currently support this belief. Incremented on reflect merges.
+    proof_count: int = 0
+    # Change history as a JSON-encoded list of {at, action, sources} entries.
+    history_json: Optional[str] = None
 
 
 class SessionSummary(BaseModel):
