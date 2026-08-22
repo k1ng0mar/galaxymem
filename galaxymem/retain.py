@@ -33,6 +33,19 @@ from .store import Store
 logger = logging.getLogger(__name__)
 
 from .utils import ulid as _ulid  # noqa: E402
+import threading as _threading_early
+
+
+# Audit counter: how many credential spans redacted at flag time this
+# process lifetime. Surfaced via redaction_stats() (gm_stats consumers).
+_REDACTION_COUNTER = {"spans": 0, "turns": 0}
+_REDACTION_LOCK = _threading_early.Lock()
+
+
+def redaction_stats() -> dict:
+    """Lifetime redaction counts for this process (audit signal)."""
+    with _REDACTION_LOCK:
+        return dict(_REDACTION_COUNTER)
 
 
 # ── Pass 1: Flag rules ──────────────────────────────────────────────────
@@ -270,11 +283,27 @@ def flag_turn(
     if not turn_text or not turn_text.strip():
         return False
 
+    # Flag rules run on the RAW text (a secret can itself be the memorable
+    # part: "remember my api key is ..."). Then credential-shaped strings
+    # are redacted BEFORE the flag row is created — flagged turns persist
+    # in the flags table until Pass 2 runs, and raw secrets must not sit
+    # on disk even when extraction declines them.
     reason = _apply_flag_rules(turn_text)
     if reason is None:
         reason = _tracked_entity_match(store, turn_text)
     if reason is None:
         return False
+
+    from .redact import find_secrets, redact_secrets
+
+    if find_secrets(turn_text):
+        spans = find_secrets(turn_text)
+        with _REDACTION_LOCK:
+            _REDACTION_COUNTER["spans"] += len(spans)
+            _REDACTION_COUNTER["turns"] += 1
+        logger.info("Pass 1: redacted %d credential-shaped span(s) at flag time",
+                    len(spans))
+        turn_text = redact_secrets(turn_text)
 
     flag = FlagRecord(
         id=_ulid(),
@@ -417,20 +446,25 @@ def _normalize_canonical_key(key: str) -> str:
 
 
 def _sanitize_turn_text(turn_text: str) -> str:
-    """Strip control sequences and instruction-like prefixes from flagged turn text
-    before embedding into the LLM extraction prompt.
+    """Strip control sequences and redact credential-shaped strings from
+    flagged turn text before embedding into the LLM extraction prompt.
 
     Removes attempts at prompt injection by:
-    1. XML-escaping special JSON characters that could break the prompt format
-    2. Redacting obvious injection markers
-    3. Truncating excessively long turns
+    1. Redacting secret-shaped strings (keys, tokens, password assignments)
+       so credentials never reach the LLM prompt OR the flags table
+    2. Truncating excessively long turns
+    3. JSON-escaping control characters that could break parsing
     """
     # Truncate very long turn text to cap prompt size
     text = turn_text[:4096]
+    from .redact import find_secrets, redact_secrets
+
+    if find_secrets(text):
+        logger.info("Redacted %d credential-shaped span(s) in flagged turn", len(find_secrets(text)))
+        text = redact_secrets(text)
     # JSON-escape the raw text, then strip the outer quotes — this escapes
     # quotes, backslashes, and control characters that could break parsing.
-    text = json.dumps(text)[1:-1]
-    return text
+    return json.dumps(text)[1:-1]
 
 
 def _build_extraction_prompt(flags: list[FlagRecord]) -> str:

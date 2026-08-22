@@ -203,6 +203,20 @@ def test_tracked_entity_label_flags_turn():
         store.close()
 
 
+def test_flag_turn_redacts_secrets():
+    """Pass-1: credential-shaped strings are redacted before persistence."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _fresh_store(tmpdir)
+        secret_turn = "remember that my api key is sk-proj-abc123def456GHI789jklMNO"
+        assert flag_turn(store, secret_turn,
+                         "session-redact", "cli", "hermes-user") is True
+        flags = store.unprocessed_flags()
+        assert len(flags) == 1
+        assert "sk-proj-abc123def456" not in flags[0].turn_text
+        assert "[REDACTED]" in flags[0].turn_text
+        store.close()
+
+
 if __name__ == "__main__":
     test_retain_integration()
     print("All tests passed!")

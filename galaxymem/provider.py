@@ -1421,6 +1421,13 @@ class GalaxyMemProvider(MemoryProvider):
             self._warn_on_exc("GalaxyMem stats failed", e)
             return tool_error(f"Stats failed: {e}")
 
+        # Redaction audit signal (process-lifetime counts)
+        try:
+            from .retain import redaction_stats
+            stats["redactions"] = redaction_stats()
+        except Exception:
+            pass
+
         self._record_success()
         return json.dumps({"stats": stats, "db_path": self._db_path})
 
