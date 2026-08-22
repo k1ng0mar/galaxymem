@@ -2,8 +2,8 @@
 
 Applied in retain.py BEFORE flagged turn text is written to the flags
 table, so credentials never persist even when the LLM extraction
-correctly declines to memorize them. Inspired by mnemosyne's pre-write
-filter (see vault/projects/galaxymem/reviews, 2026-08-22).
+correctly declines to memorize them. (Pre-write filtering pattern
+popularized by mnemosyne's write classifier.)
 """
 
 from __future__ import annotations
