@@ -22,6 +22,9 @@ HOT_CACHE_TOKEN_BUDGET = int(os.environ.get("GALAXYMEM_HOT_CACHE_TOKEN_BUDGET", 
 # Pass 2 triggers
 PASS2_FLAG_THRESHOLD = int(os.environ.get("GALAXYMEM_PASS2_FLAG_THRESHOLD", "12"))
 PASS2_IDLE_MINUTES = int(os.environ.get("GALAXYMEM_PASS2_IDLE_MINUTES", "20"))
+# A batch whose extraction failed this many times is parked (left
+# unprocessed but never retried) instead of poisoning every trigger.
+PASS2_MAX_ATTEMPTS = int(os.environ.get("GALAXYMEM_PASS2_MAX_ATTEMPTS", "3"))
 
 # Decay
 DECAY_HALF_LIFE_DAYS = float(os.environ.get("GALAXYMEM_DECAY_HALF_LIFE_DAYS", "30"))
