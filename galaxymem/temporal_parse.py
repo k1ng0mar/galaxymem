@@ -1,10 +1,9 @@
 """Temporal range extraction from natural-language recall queries.
 
 Regex-only v1 (no LLM call) — recognizes ISO dates/months, named months
-with optional years, and a small set of relative expressions. Inspired by
-hindsight's temporal retrieval arm (see vault/projects/galaxymem/reviews,
-2026-08-22): date-scoped queries get a dedicated retrieval signal instead
-of fighting brightness decay.
+with optional years, and a small set of relative expressions. Temporal
+retrieval arm pattern inspired by hindsight: date-scoped queries get a
+dedicated retrieval signal instead of fighting recency decay.
 """
 
 from __future__ import annotations
