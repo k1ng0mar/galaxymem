@@ -457,6 +457,39 @@ GM_SESSION_SEARCH_SCHEMA = {
     },
 }
 
+GM_REASON_SCHEMA = {
+    "name": "gm_reason",
+    "description": (
+        "Reason over GalaxyMem memories to answer a question with evidence. "
+        "Runs a lightweight agentic loop: checks consolidated opinions "
+        "(observations), then raw facts, then synthesizes a grounded answer "
+        "with source ids + confidence. Use when you need a reasoned, "
+        "evidence-backed synthesis rather than a raw memory dump. "
+        "Runs synchronously; returns the reasoning + sources."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The question to reason about.",
+            },
+            "entities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Entity ids/labels to scope the reasoning to (hard filter).",
+                "default": [],
+            },
+            "max_sources": {
+                "type": "integer",
+                "description": "Max source memories to consider (default 8, max 20).",
+                "default": 8,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # GalaxyMemProvider
@@ -926,6 +959,7 @@ class GalaxyMemProvider(MemoryProvider):
             GM_UPDATE_ENTITY_SCHEMA,
             GM_EXPORT_SCHEMA,
             GM_SESSION_SEARCH_SCHEMA,
+            GM_REASON_SCHEMA,
         ]
 
     # -- tool dispatch ------------------------------------------------------------
@@ -992,6 +1026,9 @@ class GalaxyMemProvider(MemoryProvider):
 
                 elif tool_name == "gm_session_search":
                     return self._handle_session_search(args)
+
+                elif tool_name == "gm_reason":
+                    return self._handle_reason(args)
 
                 return tool_error(f"Unknown tool: {tool_name}")
 
@@ -1411,6 +1448,46 @@ class GalaxyMemProvider(MemoryProvider):
 
         self._record_success()
         return json.dumps(card, default=str)
+
+    def _handle_reason(self, args: dict) -> str:
+        """gm_reason: evidence-backed reasoning over memories (synchronous)."""
+        from .reason import reason as do_reason
+
+        query = (args.get("query") or "").strip()
+        if not query:
+            return tool_error("Missing required parameter: query")
+
+        max_sources = min(int(args.get("max_sources", 8)), 20)
+
+        raw_entities = [e for e in (args.get("entities") or []) if (e or "").strip()]
+        entity_ids = self._resolve_entity_args(raw_entities)
+        if raw_entities and not entity_ids:
+            # Fail-closed: named entities but none resolved → refuse unscoped.
+            return tool_error(
+                "None of the given entity labels matched a tracked entity; "
+                "refusing to run an unscoped reasoning. Check the names, or "
+                "omit 'entities' to search the whole memory store."
+            )
+
+        if self._llm_client is None:
+            return tool_error("No LLM available for reasoning")
+
+        if self._store is None:
+            return tool_error("GalaxyMem store not initialized.")
+
+        try:
+            result = do_reason(
+                self._store, self._llm_client, query,
+                entity_ids=entity_ids or None, max_sources=max_sources,
+            )
+        except Exception as e:
+            self._record_failure()
+            self._warn_on_exc("GalaxyMem reason failed", e)
+            return tool_error(f"Reason failed: {e}")
+
+        self._record_success()
+        self._maybe_release_fragment_fds()
+        return json.dumps(result, default=str)
 
     def _handle_stats(self, args: dict) -> str:
         """gm_stats: memory statistics."""
