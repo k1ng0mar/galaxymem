@@ -1160,10 +1160,12 @@ class GalaxyMemProvider(MemoryProvider):
                 "created_at": mem.created_at.isoformat() if mem.created_at else None,
                 "age_days": (now - mem.created_at).days if mem.created_at else None,
                 "recall_count": mem.recall_count,
+                "recall_miss_count": mem.recall_miss_count,
                 "canonical_key": mem.canonical_key,
                 "reflect_cycles": mem.reflect_cycles,
                 "confidence": conf,
                 "confidence_tier": classify_confidence(conf),
+                "evidence_quotes": mem.evidence_quotes or [],
             })
         payload = {"results": items, "count": len(items), "query": query}
         if as_of is not None:
@@ -1441,6 +1443,7 @@ class GalaxyMemProvider(MemoryProvider):
                 "status": m.status.value,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "recall_count": m.recall_count,
+                "evidence_quotes": m.evidence_quotes or [],
             }
             for m in memories
         ]

@@ -458,6 +458,15 @@ def deep_recall(
                 except Exception as e:
                     logger.warning("Failed to touch memory %s: %s", mem_id, e)
             _nudge_corecalled_edges(store, top_ids)
+            # Usefulness feedback: candidates that were retrieved but NOT in the
+            # final top-k are "misses" — they cost retrieval but weren't used.
+            # Returned ones are "hits". Feeds the promote/demote usefulness policy.
+            try:
+                miss_ids = [mid for mid in candidates if mid not in set(top_ids)]
+                for mid in miss_ids:
+                    store.bump_recall_miss(mid)
+            except Exception as e:
+                logger.debug("Usefulness miss tracking skipped: %s", e)
 
         logger.info(
             "Deep recall for '%s'%s: %d candidates → %d results",
