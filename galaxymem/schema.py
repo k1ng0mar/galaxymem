@@ -28,6 +28,7 @@ class MemoriesTable(LanceModel):
     created_at: str  # ISO datetime string
     last_recalled_at: Optional[str] = None
     recall_count: int = 0
+    recall_miss_count: int = 0
     reflect_cycles: int = 0
     source_session_id: Optional[str] = None
     source_platform: Optional[str] = None
@@ -36,6 +37,7 @@ class MemoriesTable(LanceModel):
     flagged_source: Optional[str] = None
     canonical_key: Optional[str] = None  # subject|predicate|object for structured facts
     proof_count: int = 0  # provenance strength for derived records (opinions)
+    evidence_quotes: str = "[]"  # JSON-encoded list of verbatim supporting quotes
     history_json: Optional[str] = None  # JSON-encoded [{at, action, sources}]
 
 
