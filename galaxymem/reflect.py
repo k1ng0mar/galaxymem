@@ -295,6 +295,13 @@ def _run_reflection_locked(store, llm_client: LLMClient) -> dict[str, Any]:
                 touched_entities.add(entity_id)
                 report["reflection_records"].extend(records)
 
+        # 5e — staleness re-verify: check existing opinions against newer
+        # evidence BEFORE forming new ones, so fresh facts inform beliefs.
+        try:
+            _reverify_opinions(store, llm_client, report)
+        except Exception as e:
+            logger.warning("Staleness re-verify failed: %s", e)
+
         # 5a — opinion formation for entities with >= 3 new memories
         for entity_id, mems in new_by_entity.items():
             if len(mems) < 3:
@@ -311,6 +318,13 @@ def _run_reflection_locked(store, llm_client: LLMClient) -> dict[str, Any]:
 
         # 5d — housekeeping
         _increment_reflect_cycles(store)
+        try:
+            usefulness = _apply_usefulness_policy(store, report)
+            if usefulness["demoted"] or usefulness["revived"]:
+                logger.info("Usefulness policy: %d demoted, %d revived",
+                            usefulness["demoted"], usefulness["revived"])
+        except Exception as e:
+            logger.warning("Usefulness policy failed: %s", e)
         report["entity_suggestions"] = _nominate_entities(store)
         from .entities import _cleanup_stale_provisionals
         cleaned = _cleanup_stale_provisionals(store)
@@ -509,6 +523,31 @@ def _apply_contradiction(store, mem_a: MemoryRecord, mem_b: MemoryRecord,
 
 # ── 5a: opinion formation ──────────────────────────────────────────────────
 
+
+def _validate_evidence_quotes(quotes: list, source_ids: list[str],
+                              by_id: dict[str, MemoryRecord]) -> list[str]:
+    """Keep only quotes that are verbatim substrings of their source memory.
+
+    The LLM may return paraphrased or invented 'quotes'; a quote is only
+    trustworthy if it appears verbatim inside the memory it claims to cite.
+    Quotes not tied to a valid source id are dropped. Result is deduped.
+    """
+    if not isinstance(quotes, list):
+        return []
+    valid: list[str] = []
+    seen: set[str] = set()
+    for q in quotes:
+        q = (q or "").strip()
+        if not q or q in seen:
+            continue
+        # Only check against sids that exist in by_id; skip missing ones
+        # (never construct a default MemoryRecord — that raises on required fields)
+        if any(sid in by_id and q in by_id[sid].text for sid in source_ids):
+            valid.append(q)
+            seen.add(q)
+    return valid
+
+
 _OPINION_PROMPT = """You maintain opinions (revisable beliefs) about entity '{entity_id}' derived from stored facts and events.
 
 Facts and events (each line: [memory_id] text):
@@ -524,10 +563,14 @@ Return ONLY JSON:
   "opinions": [
     {{
       "text": "the opinion, stated as a belief in 1-2 sentences",
-      "source_memory_ids": ["id1", "id2"]
+      "source_memory_ids": ["id1", "id2"],
+      "evidence_quotes": ["verbatim quote from id1 supporting this", "verbatim quote from id2 supporting this"]
     }}
   ]
 }}
+
+For evidence_quotes, use EXACT verbatim text from the source memories (a short
+distinctive substring of each source). Do not paraphrase.
 
 If no new pattern is clearly supported, return {{"opinions": []}}.
 """
@@ -573,7 +616,12 @@ def _form_opinions_for_entity(store, llm_client: LLMClient, entity_id: str,
         if not text or len(source_ids) < _MIN_OPINION_SOURCES:
             continue
 
-        merged = _merge_into_existing_opinion(store, entity_id, text, source_ids, existing)
+        # Validate evidence quotes: must be verbatim substrings of the source
+        # memories they claim to support. Prevents the LLM from attaching
+        # hallucinated / paraphrased "quotes" to a belief.
+        quotes = _validate_evidence_quotes(item.get("evidence_quotes", []), source_ids, by_id)
+
+        merged = _merge_into_existing_opinion(store, entity_id, text, source_ids, existing, quotes)
         if merged is not None:
             report["opinions_merged"] += 1
             records.append(ReflectionRecord(
@@ -587,6 +635,7 @@ def _form_opinions_for_entity(store, llm_client: LLMClient, entity_id: str,
             entity_ids=[entity_id], source_memory_ids=source_ids,
             status=MemoryStatus.active,
             proof_count=len(source_ids),
+            evidence_quotes=quotes,
         )
         store.add_memory(opinion)
         for sid in source_ids:
@@ -605,7 +654,8 @@ def _form_opinions_for_entity(store, llm_client: LLMClient, entity_id: str,
 
 def _merge_into_existing_opinion(store, entity_id: str, text: str,
                                  source_ids: list[str],
-                                 existing: list[MemoryRecord]) -> Optional[str]:
+                                 existing: list[MemoryRecord],
+                                 quotes: Optional[list[str]] = None) -> Optional[str]:
     """If an equivalent opinion exists, append sources instead of duplicating.
 
     A demoted equivalent is revived (5c revival) since it now has fresh
@@ -642,11 +692,16 @@ def _merge_into_existing_opinion(store, entity_id: str, text: str,
             "action": "merge",
             "sources": list(source_ids),
         })
+        # Merge quotes too: union existing + new validated quotes.
+        existing_quotes = list(candidate.evidence_quotes or [])
+        new_quotes = list(quotes or [])
+        combined_quotes = list(dict.fromkeys([*existing_quotes, *new_quotes]))
         store.update_memory_field(
             candidate.id,
             source_memory_ids=combined,
             proof_count=new_proof,
             history_json=_json.dumps(history),
+            evidence_quotes=combined_quotes,
         )
         for sid in source_ids:
             if sid not in candidate.source_memory_ids:
@@ -657,6 +712,169 @@ def _merge_into_existing_opinion(store, entity_id: str, text: str,
             logger.info("Revived demoted opinion %s with fresh sources", candidate.id)
         return candidate.id
     return None
+
+
+# ── 5e: staleness re-verify ────────────────────────────────────────────────
+
+_REVERIFY_PROMPT = """You are re-verifying a previously held opinion about entity '{entity_id}' against newer evidence.
+
+OPINION: {opinion_text}
+
+SUPPORTING SOURCES (the memories this opinion was based on):
+{support_lines}
+
+NEWER EVIDENCE (memories created or updated since the opinion was formed):
+{newer_lines}
+
+Does the newer evidence still support this opinion, contradict it, or is there
+not enough relevant new evidence to decide?
+
+Return ONLY JSON:
+{{
+  "verdict": "supported|contradicted|insufficient_evidence",
+  "reason": "one-sentence explanation",
+  "contradiction": "if contradicted, describe the contradiction; otherwise empty string"
+}}
+"""
+
+
+def _reverify_opinions(store, llm_client: LLMClient, report: dict) -> int:
+    """Check active opinions against newer evidence; demote unsupported ones.
+
+    For each active opinion, fetch world/experience facts created after the
+    opinion's creation time. If any exist, ask the LLM whether the new
+    evidence contradicts the opinion. If contradicted, demote the opinion.
+
+    Returns the number of demoted opinions.
+    """
+    opinions = store.list_memories(network=Network.opinion, status=MemoryStatus.active)
+    demoted = 0
+
+    for opinion in opinions:
+        if not opinion.created_at:
+            continue
+        # Find newer world/experience facts (not opinions) for this entity
+        newer: list[MemoryRecord] = []
+        for eid in opinion.entity_ids:
+            try:
+                newer.extend(store.list_memories(
+                    network=Network.world,
+                    status=MemoryStatus.active,
+                    entity_ids=[eid],
+                    since=opinion.created_at,
+                ))
+                newer.extend(store.list_memories(
+                    network=Network.experience,
+                    status=MemoryStatus.active,
+                    entity_ids=[eid],
+                    since=opinion.created_at,
+                ))
+            except Exception:
+                continue
+        if not newer:
+            continue
+
+        # Fetch the source memory texts for the opinion's supporting sources
+        by_id = {}
+        support_lines = []
+        for sid in (opinion.source_memory_ids or []):
+            src = store.get_memory(sid)
+            if src is not None:
+                by_id[sid] = src
+                support_lines.append(f"[{src.id}] {src.text}")
+
+        newer_lines = [f"[{m.id}] ({m.created_at.strftime('%Y-%m-%d')}) {m.text}"
+                       for m in newer[:8]]
+
+        prompt = _REVERIFY_PROMPT.format(
+            entity_id=(", ".join(opinion.entity_ids) if opinion.entity_ids else "unknown"),
+            opinion_text=opinion.text,
+            support_lines="\n".join(support_lines) or "(none)",
+            newer_lines="\n".join(newer_lines) or "(none)",
+        )
+
+        try:
+            response = llm_client.chat([{"role": "user", "content": prompt}])
+        except Exception as e:
+            logger.debug("Reverify LLM failed for %s: %s", opinion.id, e)
+            continue
+
+        parsed = _parse_json_object(response, {"verdict": "insufficient_evidence"})
+        verdict = parsed.get("verdict", "insufficient_evidence")
+
+        if verdict == "contradicted":
+            store.update_memory_status(opinion.id, MemoryStatus.demoted)
+            demoted += 1
+            report.setdefault("opinions_demoted", 0)
+            report["opinions_demoted"] += 1
+            logger.info("Demoted opinion %s (re-verify: %s)", opinion.id,
+                        parsed.get("reason", "contradicted"))
+            report.setdefault("reflection_records", []).append(
+                ReflectionRecord(
+                    id=_ulid(), action="demote_opinion", memory_ids=[opinion.id],
+                    reason=f"Staleness re-verify: {parsed.get('reason', 'contradicted by newer evidence')}",
+                )
+            )
+        elif verdict == "supported":
+            # Opinion is still valid — optionally bump reflect_cycles
+            # (already handled by _increment_reflect_cycles elsewhere)
+            logger.debug("Opinion %s still supported by newer evidence", opinion.id)
+
+    return demoted
+
+
+# ── 5f: usefulness feedback policy ──────────────────────────────────────────
+
+# A memory is "useless" if it's recalled a lot but never lands in the final
+# top-k the caller uses (high miss ratio). "Useful" if it's consistently used.
+_USEFULNESS_MIN_RECALLS = 3
+_USEFULNESS_DEMOTE_RATIO = 0.25   # miss ratio above this → demote
+_USEFULNESS_PROMOTE_RATIO = 0.6   # miss ratio below this + enough recalls → revive
+
+
+def _usefulness_ratio(mem: MemoryRecord) -> Optional[float]:
+    """Return usefulness = hits / (hits + misses), or None if too few recalls."""
+    hits = mem.recall_count
+    misses = mem.recall_miss_count
+    if hits + misses < _USEFULNESS_MIN_RECALLS:
+        return None
+    return hits / (hits + misses)
+
+
+def _apply_usefulness_policy(store, report: dict) -> dict[str, int]:
+    """Promote useful memories, demote useless ones (mnemosyne feedback parity).
+
+    Uses recall_count (hits) vs recall_miss_count (misses) tracked during
+    deep_recall. Memories that are consistently retrieved but never used get
+    demoted; consistently-used ones are kept active / revived from demoted.
+    """
+    result = {"demoted": 0, "revived": 0}
+    try:
+        active = store.list_memories(status=MemoryStatus.active)
+        demoted = store.list_memories(status=MemoryStatus.demoted)
+    except Exception as e:
+        logger.warning("Usefulness policy list failed: %s", e)
+        return result
+
+    for mem in active:
+        ratio = _usefulness_ratio(mem)
+        if ratio is None:
+            continue
+        if ratio < _USEFULNESS_DEMOTE_RATIO:
+            store.update_memory_status(mem.id, MemoryStatus.demoted)
+            result["demoted"] += 1
+            logger.info("Demoted low-usefulness memory %s (usefulness %.2f)", mem.id, ratio)
+
+    for mem in demoted:
+        ratio = _usefulness_ratio(mem)
+        if ratio is None:
+            continue
+        if ratio > _USEFULNESS_PROMOTE_RATIO:
+            store.update_memory_status(mem.id, MemoryStatus.active)
+            result["revived"] += 1
+            logger.info("Revived high-usefulness memory %s (usefulness %.2f)", mem.id, ratio)
+
+    return result
 
 
 # ── 5c: opinion invalidation cascade ───────────────────────────────────────

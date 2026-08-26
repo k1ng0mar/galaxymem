@@ -201,6 +201,7 @@ def _from_memory(t) -> MemoryRecord:
         created_at=datetime.fromisoformat(str(t["created_at"] if isinstance(t, dict) else t.created_at)),
         last_recalled_at=datetime.fromisoformat(str(t["last_recalled_at"])) if _safe_str(t["last_recalled_at"] if isinstance(t, dict) else t.last_recalled_at) else None,
         recall_count=int(t["recall_count"] if isinstance(t, dict) else t.recall_count),
+        recall_miss_count=int(t.get("recall_miss_count", 0) or 0) if isinstance(t, dict) else int(getattr(t, 'recall_miss_count', 0) or 0),
         reflect_cycles=int(t["reflect_cycles"] if isinstance(t, dict) else getattr(t, 'reflect_cycles', 0)),
         source_session_id=_safe_str(t["source_session_id"] if isinstance(t, dict) else t.source_session_id),
         source_platform=_safe_str(t["source_platform"] if isinstance(t, dict) else t.source_platform),
@@ -210,6 +211,7 @@ def _from_memory(t) -> MemoryRecord:
         canonical_key=_safe_str(t.get("canonical_key") if isinstance(t, dict) else getattr(t, 'canonical_key', None)),
         proof_count=int(t.get("proof_count", 0) or 0) if isinstance(t, dict) else int(getattr(t, 'proof_count', 0) or 0),
         history_json=_safe_str(t.get("history_json") if isinstance(t, dict) else getattr(t, 'history_json', None)),
+        evidence_quotes=_safe_json(t.get("evidence_quotes") if isinstance(t, dict) else getattr(t, 'evidence_quotes', None), "[]"),
     )
 
 
@@ -227,6 +229,7 @@ def _to_memory_row(m: MemoryRecord) -> dict:
         "created_at": m.created_at.isoformat() if isinstance(m.created_at, datetime) else m.created_at,
         "last_recalled_at": m.last_recalled_at.isoformat() if m.last_recalled_at else None,
         "recall_count": m.recall_count,
+        "recall_miss_count": m.recall_miss_count,
         "reflect_cycles": m.reflect_cycles,
         "source_session_id": m.source_session_id,
         "source_platform": m.source_platform,
@@ -236,6 +239,7 @@ def _to_memory_row(m: MemoryRecord) -> dict:
         "canonical_key": m.canonical_key,
         "proof_count": m.proof_count,
         "history_json": m.history_json,
+        "evidence_quotes": json.dumps(m.evidence_quotes),
     }
 
 
@@ -408,9 +412,15 @@ class Store:
             if "proof_count" not in existing:
                 tbl.add_columns({"proof_count": pa.int64()})
                 logger.info("Migrated memories table: added column proof_count")
+            if "recall_miss_count" not in existing:
+                tbl.add_columns({"recall_miss_count": pa.int64()})
+                logger.info("Migrated memories table: added column recall_miss_count")
             if "history_json" not in existing:
                 tbl.add_columns({"history_json": pa.string()})
                 logger.info("Migrated memories table: added column history_json")
+            if "evidence_quotes" not in existing:
+                tbl.add_columns({"evidence_quotes": pa.string()})
+                logger.info("Migrated memories table: added column evidence_quotes")
         except Exception as e:
             logger.warning("memories schema migration skipped: %s", e)
 
@@ -573,6 +583,17 @@ class Store:
                     "last_recalled_at": _now_iso(),
                 "recall_count": mem.recall_count + 1,
             },
+        )
+
+    def bump_recall_miss(self, memory_id: str) -> None:
+        """Increment recall_miss_count — this memory was retrieved but unused."""
+        self._assert_writable()
+        mem = self.get_memory(memory_id)
+        if not mem:
+            return
+        self._memories.update(
+            where=f'id = "{_esc(memory_id)}"',
+            values={"recall_miss_count": mem.recall_miss_count + 1},
         )
 
     def update_memory_field(self, memory_id: str, **kwargs) -> None:
