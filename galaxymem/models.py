@@ -62,6 +62,9 @@ class MemoryRecord(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_recalled_at: Optional[datetime] = None
     recall_count: int = 0
+    # How many times this memory was a recall candidate but NOT returned in the
+    # final top-k the caller used. Feeds the usefulness policy (promote/demote).
+    recall_miss_count: int = 0
     reflect_cycles: int = 0  # Number of reflection cycles this memory has been through
     source_session_id: Optional[str] = None
     source_platform: Optional[str] = None
@@ -77,6 +80,10 @@ class MemoryRecord(BaseModel):
     # Provenance strength for derived records (opinions): how many distinct
     # sources currently support this belief. Incremented on reflect merges.
     proof_count: int = 0
+    # Verbatim supporting text for consolidated records (opinions). Each entry
+    # is an exact quote from a source memory, so a belief is directly checkable
+    # against its sources (hindsight observation parity).
+    evidence_quotes: list[str] = Field(default_factory=list)
     # Change history as a JSON-encoded list of {at, action, sources} entries.
     history_json: Optional[str] = None
 

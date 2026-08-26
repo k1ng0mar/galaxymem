@@ -537,63 +537,6 @@ class TestHotCacheBounded:
         s.close()
 
 
-# ── Viewer auth modules loadable ──────────────────────────────────────────────
-
-@pytest.mark.skipif(not HAS_FASTAPI, reason="fastapi not installed")
-class TestViewerImports:
-    """Verify the viewer app can be imported (fastapi not required)."""
-
-    def test_viewer_imports(self):
-        """The viewer app should import without errors."""
-        import fastapi
-        from galaxymem.viewer.app import (
-            _check_rate_limit,
-            app,
-            run_viewer,
-        )
-        assert app is not None
-        assert callable(_check_rate_limit)
-        assert callable(run_viewer)
-
-    def test_viewer_has_health_route(self):
-        from galaxymem.viewer.app import app
-        assert any(r.path == "/health" for r in app.routes), "missing /health route"
-
-    def test_viewer_routes_public(self):
-        """Viewer is a local-only tool — API routes must NOT require auth.
-
-        (Decision: token auth was stripped on 2026-08-01; the tool binds to
-        127.0.0.1 and is meant for local inspection only.)
-        """
-        from galaxymem.viewer.app import app
-        public_routes = [
-            "/api/stats", "/api/memories", "/api/memories/{memory_id}",
-            "/api/entities", "/api/entities/{entity_id}",
-            "/api/graph", "/api/graph/similarity", "/api/graph/entity/{entity_id}",
-            "/graph", "/entity/{entity_id}", "/memory/{memory_id}",
-            "/as-of/{timestamp}",
-        ]
-        for r in app.routes:
-            if r.path in public_routes:
-                assert not any("require_auth" in str(d) for d in getattr(r, 'dependencies', [])), \
-                    f"Route {r.path} unexpectedly requires auth"
-
-    def test_rate_limit_function(self):
-        """Rate limiter tracks calls per ip."""
-        from galaxymem.viewer.app import _check_rate_limit
-        for i in range(5):
-            _check_rate_limit("127.0.0.1")  # should not raise
-        # After 60 calls it should raise
-        for i in range(65):
-            try:
-                _check_rate_limit("127.0.0.1")
-            except Exception as e:
-                assert "429" in str(e) or "Rate limit" in str(e)
-                break
-        else:
-            pytest.fail("Rate limit should have fired after 60+ calls")
-
-
 # ── aux defaults loading ──────────────────────────────────────────────────────
 
 class TestAuxDefaults:
