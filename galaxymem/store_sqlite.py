@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS memories (
     canonical_key TEXT,
     proof_count INTEGER NOT NULL DEFAULT 0,
     evidence_quotes TEXT NOT NULL DEFAULT '[]',
-    history_json TEXT
+    history_json TEXT,
+    occurred_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -127,6 +128,21 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     text TEXT NOT NULL,
     message_count INTEGER NOT NULL DEFAULT 0,
     last_updated TEXT NOT NULL
+);
+
+-- Mental models: user-curated summaries checked FIRST in reflect. Each one
+-- is a saved reflect answer scoped to a topic, refreshed automatically when
+-- the underlying observations change. This is the "curate once, surface
+-- forever" layer above raw memories.
+CREATE TABLE IF NOT EXISTS mental_models (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source_query TEXT NOT NULL,
+    scope_tags TEXT NOT NULL DEFAULT '[]',  -- JSON list of tags; empty = global
+    last_refreshed_at TEXT,
+    refresh_after_consolidation INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_network ON memories(network);
@@ -204,6 +220,14 @@ class Store:
         with self._write_lock:
             self._conn.executescript(_SCHEMA_SQL)
             self._conn.executescript(_FTS_SQL)
+            # Light migrations: ALTER TABLE is idempotent-friendly in SQLite via
+            # the try/except — older DBs from before 0.2.1 need `occurred_at`
+            # added to memories.
+            for stmt in ("ALTER TABLE memories ADD COLUMN occurred_at TEXT",):
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             # Load sqlite-vec if available; vector search falls back to
             # in-Python brute force when the extension is absent.
             try:
@@ -297,8 +321,8 @@ class Store:
                     recall_count, recall_miss_count, reflect_cycles,
                     source_session_id, source_platform, speaker_entity_id,
                     promoted_to, flagged_source, canonical_key, proof_count,
-                    evidence_quotes, history_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    evidence_quotes, history_json, occurred_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (row[0], row[1], self._vec_to_blob(vec), *row[2:]),
             )
             self._conn.execute(
@@ -325,8 +349,8 @@ class Store:
                         recall_count, recall_miss_count, reflect_cycles,
                         source_session_id, source_platform, speaker_entity_id,
                         promoted_to, flagged_source, canonical_key, proof_count,
-                        evidence_quotes, history_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        evidence_quotes, history_json, occurred_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (row[0], row[1], self._vec_to_blob(vec), *row[2:]),
                 )
                 self._conn.execute(
@@ -349,6 +373,7 @@ class Store:
             m.source_session_id, m.source_platform, m.speaker_entity_id,
             m.promoted_to, m.flagged_source, m.canonical_key, m.proof_count,
             self._dumps(m.evidence_quotes), m.history_json,
+            m.occurred_at.isoformat() if m.occurred_at else None,
         )
 
     @staticmethod
@@ -378,6 +403,7 @@ class Store:
             canonical_key=r["canonical_key"], proof_count=r["proof_count"] or 0,
             evidence_quotes=json.loads(r["evidence_quotes"] or "[]"),
             history_json=r["history_json"],
+            occurred_at=_dt(r["occurred_at"]) if "occurred_at" in r.keys() else None,
         )
 
     def _embed(self, text: str) -> list[float]:
@@ -1153,6 +1179,55 @@ class Store:
             ))
         return out
 
+    # ── Mental models ───────────────────────────────────────────────────
+
+    def upsert_mental_model(
+        self, id: str, name: str, content: str, source_query: str,
+        scope_tags: Optional[list[str]] = None,
+        refresh_after_consolidation: bool = False,
+    ) -> None:
+        """Insert or update a mental model (a curated reflect answer)."""
+        self._execute(
+            """INSERT OR REPLACE INTO mental_models
+               (id, name, content, source_query, scope_tags,
+                last_refreshed_at, refresh_after_consolidation, created_at)
+               VALUES (?,?,?,?,?,?,?,COALESCE(
+                 (SELECT created_at FROM mental_models WHERE id = ?),
+                 ?))""",
+            (id, name, content, source_query,
+             json.dumps(scope_tags or []),
+             datetime.now(timezone.utc).isoformat(),
+             1 if refresh_after_consolidation else 0,
+             id,
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+    def get_mental_model(self, id: str) -> Optional[dict]:
+        row = self._query("SELECT * FROM mental_models WHERE id = ?", (id,))
+        if not row:
+            return None
+        return self._mental_model_row_to_dict(row[0])
+
+    def list_mental_models(self) -> list[dict]:
+        rows = self._query("SELECT * FROM mental_models ORDER BY name")
+        return [self._mental_model_row_to_dict(r) for r in rows]
+
+    def delete_mental_model(self, id: str) -> None:
+        self._execute("DELETE FROM mental_models WHERE id = ?", (id,))
+
+    @staticmethod
+    def _mental_model_row_to_dict(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "name": r["name"],
+            "content": r["content"],
+            "source_query": r["source_query"],
+            "scope_tags": json.loads(r["scope_tags"] or "[]"),
+            "last_refreshed_at": r["last_refreshed_at"],
+            "refresh_after_consolidation": bool(r["refresh_after_consolidation"]),
+            "created_at": r["created_at"],
+        }
+
     # ── Stats ────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
@@ -1184,14 +1259,16 @@ class Store:
     def as_of(self, timestamp: datetime) -> "_AsOfView":
         """Return a read-only view of the store as it was at `timestamp`.
 
-        SQLite has no native time-travel; we approximate with created_at
-        filters (memories that did not exist yet are invisible). Raises
-        ValueError if the timestamp predates every record in the store —
-        mirroring the LanceDB version-not-found contract.
+        SQLite has no native time-travel; we approximate with time-of-fact
+        filters (COALESCE(occurred_at, created_at) — memories that happened
+        later are invisible). Raises ValueError if the timestamp predates
+        every record in the store.
         """
         if self._conn is None or self._closed:
             raise RuntimeError("Store is not open")
-        row = self._query("SELECT MIN(created_at) AS earliest FROM memories")[0]
+        row = self._query(
+            "SELECT MIN(COALESCE(occurred_at, created_at)) AS earliest FROM memories"
+        )[0]
         earliest = row["earliest"] if row else None
         if earliest is not None:
             try:
@@ -1222,8 +1299,10 @@ class _AsOfView:
         kw.pop("status_filter", None)
         kw.pop("exclude_status", None)
         # Include superseded (they were active then); exclude future records.
+        # Time-of-fact = occurred_at when known, else created_at.
         rows = self._store._query(
-            "SELECT * FROM memories WHERE created_at <= ? AND status NOT IN ('archived', 'demoted')",
+            "SELECT * FROM memories WHERE COALESCE(occurred_at, created_at) <= ? "
+            "AND status NOT IN ('archived', 'demoted')",
             (self._as_of.isoformat(),),
         )
         records = [self._store._row_to_memory(r) for r in rows]
@@ -1237,15 +1316,23 @@ class _AsOfView:
         kw.pop("exclude_status", None)
         results = self._store.keyword_search(query, k=k * 2, **kw)
         cutoff = self._as_of.isoformat()
-        return [(m, s) for m, s in results if m.created_at and m.created_at.isoformat() <= cutoff][:k]
+        def _time_of(m):
+            return (m.occurred_at or m.created_at).isoformat() if (m.occurred_at or m.created_at) else ""
+        return [(m, s) for m, s in results if _time_of(m) <= cutoff][:k]
 
     def list_memories(self, **kw) -> list[MemoryRecord]:
-        """List memories that existed at the as_of timestamp."""
+        """List memories that existed at the as_of timestamp.
+
+        Uses occurred_at when set, falling back to created_at — the time of
+        fact vs the time we learned it (Hindsight-style two-timestamp model).
+        """
         kw.pop("status", None)
         out = self._store.list_memories(**kw)
         cutoff = self._as_of.isoformat() if self._as_of else None
         if cutoff:
-            return [m for m in out if m.created_at and m.created_at.isoformat() <= cutoff]
+            def _time_of(m):
+                return (m.occurred_at or m.created_at).isoformat() if (m.occurred_at or m.created_at) else ""
+            return [m for m in out if _time_of(m) <= cutoff]
         return out
 
     def get_memories_by_ids(self, ids: list[str]) -> dict[str, MemoryRecord]:

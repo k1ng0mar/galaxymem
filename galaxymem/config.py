@@ -97,6 +97,71 @@ ENTITY_CREATION_MIN_RECURRING = env_int("GALAXYMEM_ENTITY_CREATION_MIN_RECURRING
 # IVF-PQ needs a minimum corpus; below this we skip vector-index creation.
 VECTOR_INDEX_MIN_ROWS = env_int("GALAXYMEM_VECTOR_INDEX_MIN_ROWS", 256, minimum=32, maximum=100000)
 
+# ── Bank identity (mission / directives / disposition) ──────────────────────
+# Injected into reflection prompts so the store reasons with a consistent
+# character instead of a neutral one. Mission is a natural-language identity;
+# directives are hard rules the reflect agent must honor; disposition traits
+# (1-5) shape interpretation style.
+
+REFLECT_MISSION = os.environ.get(
+    "GALAXYMEM_REFLECT_MISSION",
+    "",
+).strip()
+
+# One directive per line, `#` comments allowed.
+_directives_raw = os.environ.get("GALAXYMEM_REFLECT_DIRECTIVES", "")
+REFLECT_DIRECTIVES: list[str] = [
+    ln.strip().lstrip("-").strip()
+    for ln in _directives_raw.splitlines()
+    if ln.strip() and not ln.strip().startswith("#")
+]
+
+DISPOSITION_SKEPTICISM = env_int("GALAXYMEM_DISPOSITION_SKEPTICISM", 3, minimum=1, maximum=5)
+DISPOSITION_LITERALISM = env_int("GALAXYMEM_DISPOSITION_LITERALISM", 3, minimum=1, maximum=5)
+DISPOSITION_EMPATHY = env_int("GALAXYMEM_DISPOSITION_EMPATHY", 3, minimum=1, maximum=5)
+
+_SKEPTICISM_LABEL = {1: "trusting — accept statements at face value",
+                     2: "generally trusting, mild caution",
+                     3: "balanced — weigh claims normally",
+                     4: "skeptical — question and look for corroboration",
+                     5: "highly skeptical — distrust single-source claims"}
+_LITERALISM_LABEL = {1: "flexible — read between the lines generously",
+                     2: "mostly literal",
+                     3: "balanced interpretation",
+                     4: "mostly literal — prefer exact stated meaning",
+                     5: "strictly literal — take statements at face value only"}
+_EMPATHY_LABEL = {1: "detached — facts only, ignore emotional framing",
+                  2: "low empathy",
+                  3: "balanced — note emotional context when relevant",
+                  4: "empathetic — weigh feelings alongside facts",
+                  5: "highly empathetic — emotional context is central"}
+
+
+def disposition_block() -> str:
+    """Render the disposition as a short instruction paragraph for prompts."""
+    return (
+        f"Interpretation style: {_SKEPTICISM_LABEL.get(DISPOSITION_SKEPTICISM, 'balanced')}; "
+        f"{_LITERALISM_LABEL.get(DISPOSITION_LITERALISM, 'balanced')}; "
+        f"{_EMPATHY_LABEL.get(DISPOSITION_EMPATHY, 'balanced')}."
+    )
+
+
+def bank_identity_block() -> str:
+    """Full bank-identity preamble for reflection prompts.
+
+    Includes mission (if set), directives (if set), and disposition.
+    Returns an empty string when nothing is configured, so prompts stay
+    byte-identical to the unconfigured behaviour.
+    """
+    parts: list[str] = []
+    if REFLECT_MISSION:
+        parts.append(f"Memory bank mission: {REFLECT_MISSION}")
+    if REFLECT_DIRECTIVES:
+        lines = "\n".join(f"- {d}" for d in REFLECT_DIRECTIVES)
+        parts.append(f"Hard directives (must be honored when they apply):\n{lines}")
+    parts.append(disposition_block())
+    return "\n".join(parts)
+
 
 def resolve_db_path(hermes_home: Optional[str] = None) -> Path:
     """Resolve DB path, preferring hermes_home-scoped path if hermes_home is given."""

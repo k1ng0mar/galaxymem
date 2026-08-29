@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -83,6 +84,24 @@ def _load_config(hermes_home: Optional[str] = None) -> dict:
         except (json.JSONDecodeError, OSError) as e:
             logger.error("GalaxyMem config load failed at %s: %s", config_path, e)
             raise RuntimeError(f"Invalid galaxymem.json at {config_path}: {e}") from e
+
+    # Bank identity persisted via gm_config set → apply to the config module
+    # so reflection picks it up. Env vars still win if explicitly set.
+    if config.get("reflect_mission") is not None and not os.environ.get("GALAXYMEM_REFLECT_MISSION"):
+        cfg.REFLECT_MISSION = str(config["reflect_mission"])
+    if config.get("reflect_directives") is not None and not os.environ.get("GALAXYMEM_REFLECT_DIRECTIVES"):
+        dirs = config["reflect_directives"]
+        if isinstance(dirs, list):
+            cfg.REFLECT_DIRECTIVES = [str(d) for d in dirs if str(d).strip()]
+    for key in ("skepticism", "literalism", "empathy"):
+        jkey = f"disposition_{key}"
+        env_key = f"GALAXYMEM_DISPOSITION_{key.upper()}"
+        if config.get(jkey) is not None and not os.environ.get(env_key):
+            try:
+                setattr(cfg, f"DISPOSITION_{key.upper()}",
+                        max(1, min(5, int(config[jkey]))))
+            except (TypeError, ValueError):
+                pass
 
     Path(config["db_path"]).parent.mkdir(parents=True, exist_ok=True)
     return config
@@ -314,6 +333,86 @@ GM_STATS_SCHEMA = {
         "memories per network/status, unprocessed flags, DB path."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+GM_CONFIG_SCHEMA = {
+    "name": "gm_config",
+    "description": (
+        "View or set the memory bank identity: mission (what this memory "
+        "system is for), directives (hard rules reflection must honor), and "
+        "disposition (skepticism/literalism/empathy 1-5 shaping how "
+        "memories are interpreted). Values persist to the environment-level "
+        "config and apply to future reflection cycles."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["get", "set"],
+                "description": "get = show current identity; set = update fields.",
+            },
+            "mission": {
+                "type": "string",
+                "description": "Natural-language identity for the bank (set only). Empty string clears.",
+            },
+            "directives": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Hard rules the reflect agent must follow (set only). Empty list clears.",
+            },
+            "skepticism": {"type": "integer", "minimum": 1, "maximum": 5,
+                           "description": "1=trusting … 5=highly skeptical (set only)"},
+            "literalism": {"type": "integer", "minimum": 1, "maximum": 5,
+                           "description": "1=flexible … 5=strictly literal (set only)"},
+            "empathy": {"type": "integer", "minimum": 1, "maximum": 5,
+                        "description": "1=detached … 5=highly empathetic (set only)"},
+        },
+        "required": ["action"],
+    },
+}
+
+GM_MENTAL_MODEL_SCHEMA = {
+    "name": "gm_mental_model",
+    "description": (
+        "Manage mental models: curated, always-fresh summaries checked FIRST "
+        "during reasoning (before raw memories). Actions: create (runs a "
+        "reflect pass and saves the answer under a name), get, list, delete. "
+        "Use for questions you answer often — 'what is this project', 'what "
+        "does the user prefer' — so the answer is stable instead of being "
+        "re-derived from scratch each time."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "get", "list", "delete"],
+                "description": "What to do with the mental model.",
+            },
+            "id": {
+                "type": "string",
+                "description": "Stable slug id (lowercase, hyphens). Required for get/delete; used as the create key.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Human-readable name (create only).",
+            },
+            "source_query": {
+                "type": "string",
+                "description": "The question this model answers (create only). The answer is generated from current memories.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Optional: pre-written content. If omitted on create, one is generated from the store via reflect.",
+            },
+            "refresh_after_consolidation": {
+                "type": "boolean",
+                "description": "Auto-refresh this model whenever reflection updates consolidated knowledge (create only, default false).",
+            },
+        },
+        "required": ["action"],
+    },
 }
 
 GM_REFLECT_NOW_SCHEMA = {
@@ -955,6 +1054,8 @@ class GalaxyMemProvider(MemoryProvider):
             GM_SESSION_SEARCH_SCHEMA,
             GM_REASON_SCHEMA,
             GM_EXPLAIN_RECALL_SCHEMA,
+            GM_MENTAL_MODEL_SCHEMA,
+            GM_CONFIG_SCHEMA,
         ]
 
     # -- tool dispatch ------------------------------------------------------------
@@ -1026,6 +1127,12 @@ class GalaxyMemProvider(MemoryProvider):
                     return self._handle_reason(args)
                 elif tool_name == "gm_explain_recall":
                     return self._handle_explain_recall(args)
+
+                elif tool_name == "gm_mental_model":
+                    return self._handle_mental_model(args)
+
+                elif tool_name == "gm_config":
+                    return self._handle_config(args)
 
                 return tool_error(f"Unknown tool: {tool_name}")
 
@@ -1538,6 +1645,140 @@ class GalaxyMemProvider(MemoryProvider):
 
         self._record_success()
         return json.dumps({"stats": stats, "db_path": self._db_path})
+
+    def _handle_mental_model(self, args: dict) -> str:
+        """gm_mental_model: curate summaries checked FIRST during reasoning."""
+        action = (args.get("action") or "").strip().lower()
+        try:
+            if action == "create":
+                mm_id = (args.get("id") or "").strip().lower()
+                name = (args.get("name") or "").strip()
+                source_query = (args.get("source_query") or "").strip()
+                if not mm_id or not name or not source_query:
+                    return tool_error("create requires id, name, and source_query")
+                if not re.fullmatch(r"[a-z0-9-]+", mm_id):
+                    return tool_error("id must be lowercase alphanumeric with hyphens")
+                content = (args.get("content") or "").strip()
+                if not content:
+                    # Generate the initial answer from current store content via
+                    # the reason loop (same machinery as gm_reason, minus the
+                    # mental-model lookup so we don't recurse into ourselves).
+                    from .reason import reason as reason_about
+                    result = reason_about(self._store, self._llm_client, source_query,
+                                          use_mental_models=False)
+                    content = result.get("answer") or ""
+                    if not content:
+                        return tool_error(
+                            "could not generate content from current memories; "
+                            "pass explicit content or store more memories first")
+                refresh = bool(args.get("refresh_after_consolidation", False))
+                self._store.upsert_mental_model(
+                    id=mm_id, name=name, content=content,
+                    source_query=source_query,
+                    refresh_after_consolidation=refresh,
+                )
+                self._record_success()
+                return json.dumps({"ok": True, "id": mm_id, "name": name,
+                                   "content_chars": len(content),
+                                   "refresh_after_consolidation": refresh})
+
+            if action == "get":
+                mm_id = (args.get("id") or "").strip().lower()
+                mm = self._store.get_mental_model(mm_id)
+                if mm is None:
+                    return tool_error(f"no mental model with id '{mm_id}'")
+                self._record_success()
+                return json.dumps({"mental_model": mm})
+
+            if action == "list":
+                models = self._store.list_mental_models()
+                self._record_success()
+                return json.dumps({"count": len(models),
+                                   "mental_models": [
+                                       {k: m[k] for k in ("id", "name", "last_refreshed_at")}
+                                       for m in models]})
+
+            if action == "delete":
+                mm_id = (args.get("id") or "").strip().lower()
+                self._store.delete_mental_model(mm_id)
+                self._record_success()
+                return json.dumps({"ok": True, "deleted": mm_id})
+
+            return tool_error(f"unknown action '{action}' (create|get|list|delete)")
+        except Exception as e:
+            self._record_failure()
+            self._warn_on_exc("GalaxyMem mental model op failed", e)
+            return tool_error(f"{type(e).__name__}: {e}")
+
+    def _handle_config(self, args: dict) -> str:
+        """gm_config: view/set bank identity (mission, directives, disposition)."""
+        from . import config as cfg
+
+        action = (args.get("action") or "").strip().lower()
+        try:
+            if action == "get":
+                self._record_success()
+                return json.dumps({
+                    "mission": cfg.REFLECT_MISSION,
+                    "directives": cfg.REFLECT_DIRECTIVES,
+                    "disposition": {
+                        "skepticism": cfg.DISPOSITION_SKEPTICISM,
+                        "literalism": cfg.DISPOSITION_LITERALISM,
+                        "empathy": cfg.DISPOSITION_EMPATHY,
+                    },
+                    "note": "set via gm_config set or GALAXYMEM_* env vars; "
+                            "applies to future reflection cycles",
+                })
+
+            if action == "set":
+                # Persist to $HERMES_HOME/galaxymem.json (loaded at init next
+                # session) AND apply to the live config module for this process.
+                updates: dict = {}
+                if "mission" in args:
+                    mission = str(args.get("mission") or "").strip()
+                    cfg.REFLECT_MISSION = mission
+                    updates["reflect_mission"] = mission
+                if "directives" in args:
+                    dirs = [str(d).strip() for d in (args.get("directives") or []) if str(d).strip()]
+                    cfg.REFLECT_DIRECTIVES = dirs
+                    updates["reflect_directives"] = dirs
+                for key in ("skepticism", "literalism", "empathy"):
+                    if key in args:
+                        val = int(args[key])
+                        val = max(1, min(5, val))
+                        attr = f"DISPOSITION_{key.upper()}"
+                        setattr(cfg, attr, val)
+                        updates[f"disposition_{key}"] = val
+                if not updates:
+                    return tool_error("nothing to set — pass mission/directives/skepticism/literalism/empathy")
+
+                self._persist_config(updates)
+                self._record_success()
+                return json.dumps({"ok": True, "applied": updates,
+                                   "note": "live now + persisted; full effect on next session"})
+
+            return tool_error(f"unknown action '{action}' (get|set)")
+        except Exception as e:
+            self._record_failure()
+            self._warn_on_exc("GalaxyMem config op failed", e)
+            return tool_error(f"{type(e).__name__}: {e}")
+
+    def _persist_config(self, updates: dict) -> None:
+        """Merge config updates into $HERMES_HOME/galaxymem.json."""
+        try:
+            hermes_home = os.environ.get("HERMES_HOME",
+                                         str(Path.home() / ".hermes"))
+            config_path = Path(hermes_home) / "galaxymem.json"
+            existing: dict = {}
+            if config_path.exists():
+                try:
+                    existing = json.loads(config_path.read_text(encoding="utf-8"))
+                except Exception:
+                    logger.warning("Could not read galaxymem.json; overwriting.")
+            existing.update(updates)
+            config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to persist galaxymem.json: %s", e)
 
     def _handle_session_search(self, args: dict) -> str:
         """gm_session_search: search past sessions by keyword."""

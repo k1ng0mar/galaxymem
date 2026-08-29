@@ -11,6 +11,7 @@ returns a REASONED, evidence-cited answer the agent can act on directly.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from .models import MemoryRecord, MemoryStatus, Network
@@ -191,10 +192,43 @@ def reason(
     query: str,
     entity_ids: Optional[list[str]] = None,
     max_sources: int = 8,
+    use_mental_models: bool = True,
 ) -> dict[str, Any]:
-    """Run the reasoning loop: gather → prompt → LLM → parsed answer."""
+    """Run the reasoning loop: mental models → gather → prompt → LLM → answer.
+
+    Hierarchical retrieval (Hindsight-style): when a curated mental model
+    matches the query, its saved answer is returned directly with high
+    confidence — it represents explicitly curated knowledge. Only when no
+    model matches (or use_mental_models=False) does the agentic loop run.
+    """
     if not query or not query.strip():
         return {"error": "Missing required parameter: query"}
+
+    # Tier 1: curated mental models. A model whose name or source_query
+    # overlaps the query terms strongly wins outright — cheap, stable,
+    # human-reviewed. fall through to the agentic loop otherwise.
+    if use_mental_models:
+        try:
+            models = store.list_mental_models()
+        except Exception:
+            models = []
+        q_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+        best, best_overlap = None, 0
+        for m in models:
+            m_terms = set(re.findall(r"[a-z0-9]+",
+                                     f"{m['name']} {m['source_query']}".lower()))
+            overlap = len(q_terms & m_terms)
+            if overlap > best_overlap:
+                best, best_overlap = m, overlap
+        if best is not None and best_overlap >= 2:
+            return {
+                "answer": best["content"],
+                "sources": [],
+                "confidence": "high",
+                "conflicts": [],
+                "gaps": [],
+                "used": {"mental_model": best["id"], "opinions": 0, "facts": 0},
+            }
 
     ctx = gather_context(store, query, entity_ids, max_sources)
 
