@@ -139,6 +139,7 @@ def get_last_reflect_at(store) -> Optional[datetime]:
 
 
 def _save_reflect_state(store) -> None:
+    """Atomically mark the current reflect cycle as complete on the store."""
     try:
         _state_path(store).write_text(
             json.dumps({"last_reflect_at": datetime.now(timezone.utc).isoformat()}),
@@ -146,6 +147,49 @@ def _save_reflect_state(store) -> None:
         )
     except Exception as e:
         logger.warning("Failed to persist reflect state: %s", e)
+
+
+def _refresh_mental_models(store, llm_client) -> int:
+    """Regenerate content of mental models flagged with refresh_after_consolidation.
+
+    Re-runs reason() with use_mental_models=False on each model's source_query
+    so the regenerated answer reflects every consolidation, opinion, and
+    contradiction resolution from this cycle. Updates the row's content +
+    last_refreshed_at in place. Returns the number successfully refreshed.
+
+    Failures are logged and skipped — one bad model should not abort the
+    reflect pass.
+    """
+    try:
+        models = store.list_mental_models()
+    except Exception as e:
+        logger.warning("Failed to list mental models for refresh: %s", e)
+        return 0
+    flagged = [m for m in models if m.get("refresh_after_consolidation")]
+    if not flagged:
+        return 0
+    from .reason import reason
+    refreshed = 0
+    for m in flagged:
+        try:
+            result = reason(store, llm_client, m["source_query"],
+                            use_mental_models=False)
+            new_content = (result.get("answer") or "").strip()
+            if not new_content:
+                logger.info("Skipping model %s: reason returned no answer", m["id"])
+                continue
+            store.upsert_mental_model(
+                id=m["id"], name=m["name"], content=new_content,
+                source_query=m["source_query"],
+                scope_tags=m.get("scope_tags") or [],
+                refresh_after_consolidation=True,
+            )
+            refreshed += 1
+            logger.info("Refreshed mental model %s (%d chars)",
+                        m["id"], len(new_content))
+        except Exception as e:
+            logger.warning("Failed to refresh mental model %s: %s", m["id"], e)
+    return refreshed
 
 
 def should_reflect(store) -> bool:
@@ -258,6 +302,12 @@ def _run_reflection_locked(store, llm_client: LLMClient) -> dict[str, Any]:
         if cleaned:
             logger.info("Cleaned up %d stale provisional entities", cleaned)
             report["provisionals_cleaned"] = cleaned
+        # Refresh mental models flagged with refresh_after_consolidation.
+        # Runs at the end of the cycle so it benefits from every
+        # consolidation, opinion formation, and contradiction resolution
+        # that just happened. Failures are logged and skipped — one bad
+        # model shouldn't kill the whole reflect pass.
+        report["mental_models_refreshed"] = _refresh_mental_models(store, llm_client)
         _rebuild_hot_caches(store, touched_entities)
         _save_reflect_state(store)
 

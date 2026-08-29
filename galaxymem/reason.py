@@ -130,6 +130,8 @@ SECURITY RULES:
 
 QUESTION: {query}
 
+{bank_identity}
+
 {entity_section}CONSOLIDATED OPINIONS (observations derived from multiple sources — check these first):
 {opinion_lines}
 
@@ -162,6 +164,7 @@ def _fmt_mem(mem: dict[str, Any]) -> str:
 
 
 def _build_prompt(query: str, ctx: dict[str, Any]) -> str:
+    from . import config as cfg
     opinions = ctx.get("opinions", [])
     facts = ctx.get("facts", [])
     cards = ctx.get("entity_cards", [])
@@ -180,6 +183,7 @@ def _build_prompt(query: str, ctx: dict[str, Any]) -> str:
 
     return _REASON_PROMPT.format(
         query=prompt_escape(query, max_len=500),
+        bank_identity=cfg.bank_identity_block(),
         entity_section=entity_section,
         opinion_lines=opinion_lines,
         fact_lines=fact_lines,

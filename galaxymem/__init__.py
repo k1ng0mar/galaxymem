@@ -5,7 +5,7 @@ autonomous reflection. Built for Hermes Agent but usable standalone.
 """
 
 PACKAGE_NAME = "galaxymem"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # `provider` is the ONLY Hermes-coupled module — it imports agent.* / tools.*
 # at module load. Guard it so the engine (store / retain / recall / reflect /
