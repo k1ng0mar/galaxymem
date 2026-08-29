@@ -52,8 +52,11 @@ def register(ctx) -> None:
                     sys.modules[full_name] = sub_mod
                     try:
                         sub_spec.loader.exec_module(sub_mod)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        import logging
+                        logging.getLogger("galaxymem.plugin").warning(
+                            "Failed to load inner module %s: %s", sub_name, exc,
+                        )
     else:
         pkg = sys.modules[_NS]
 

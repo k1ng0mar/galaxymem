@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galaxymem"
-version = "0.1.0"
+version = "0.1.1"
 description = "Entity-scoped memory with four-network epistemic split, decay, and autonomous reflection. LanceDB-backed."
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -31,6 +31,7 @@ dependencies = [
     "fastembed>=0.3.0",
     "pydantic>=2.0.0",
     "numpy>=1.24.0",
+    "pandas>=2.0.0",
     "requests>=2.28.0",
 ]
 
@@ -38,6 +39,9 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+]
+rerank = [
+    "sentence-transformers>=2.2.0",
 ]
 
 [tool.setuptools.packages.find]

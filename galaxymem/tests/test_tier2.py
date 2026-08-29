@@ -176,12 +176,14 @@ class TestProcedural:
     def test_extract_directive(self):
         result = extract_procedural(None, "use the direct api instead of the wrapper")
         assert result is not None
-        assert result["network"] == "procedure"
+        assert result["network"] == "observation"
+        assert result["procedural"] is True
 
     def test_extract_project_constraint(self):
         result = extract_procedural(None, "tests gate builds hard in this repo")
         assert result is not None
-        assert result["network"] == "procedure"
+        assert result["network"] == "observation"
+        assert result["procedural"] is True
 
     def test_detect_gaps_no_results(self):
         from galaxymem.procedural import detect_gaps

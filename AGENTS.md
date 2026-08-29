@@ -47,7 +47,7 @@ GalaxyMem's heavy dependencies are `lancedb` (Lance vector DB) and `fastembed`
 ```bash
 git clone https://github.com/k1ng0mar/galaxymem.git ~/.hermes/plugins/galaxymem
 cd ~/.hermes/plugins/galaxymem
-pip install -e ".[viewer]"
+pip install -e ".[dev]"
 ```
 
 Then in Hermes `config.yaml`:
@@ -71,13 +71,13 @@ If the `gm_*` tools don't appear, check:
 ```bash
 git clone https://github.com/k1ng0mar/galaxymem.git
 cd galaxymem
-pip install -e ".[viewer]"
+pip install -e ".[dev]"
 ```
 
 Verify:
 ```bash
 python -c "from galaxymem.store import Store; print('OK')"
-python -m pytest galaxymem/tests/ -q   # should show the full suite passing (currently ~229 tests; exact count grows as tests are added)
+python -m pytest galaxymem/tests/ -q   # should show the full suite passing (currently ~294 tests; exact count grows as tests are added)
 ```
 
 ---
@@ -133,7 +133,7 @@ provider class.
 
 The viewer needs the `[viewer]` extra:
 ```bash
-pip install -e ".[viewer]"
+pip install -e ".[dev]"
 ```
 
 ### Tests fail with `ImportError while loading conftest`
@@ -171,7 +171,7 @@ For Hermes Agent, config can also go in `$HERMES_HOME/galaxymem.json`.
    `store.py` has zero business logic.
 2. **The store layer is Hermes-agnostic.** Only `provider.py` imports Hermes
    internals. Keep it that way.
-3. **Tests must pass:** `pytest galaxymem/tests/ -v` (full suite; currently ~229 tests, exact count grows as tests are added).
+3. **Tests must pass:** `pytest galaxymem/tests/ -v` (full suite; currently ~294 tests, exact count grows as tests are added).
 4. **No new dependencies without justification.** The current deps are
    lancedb, fastembed, pydantic, numpy, requests. The viewer adds fastapi +
    uvicorn. Dev adds pytest.
@@ -185,11 +185,11 @@ For Hermes Agent, config can also go in `$HERMES_HOME/galaxymem.json`.
 When an AI agent is setting up GalaxyMem for a user, verify each item:
 
 - [ ] `python3 --version` shows 3.10+
-- [ ] `pip install -e ".[viewer]"` completed without errors
+- [ ] `pip install -e ".[dev]"` completed without errors
 - [ ] `python -c "from galaxymem.store import Store"` succeeds
-- [ ] `python -c "import galaxymem; print(galaxymem.__version__)"` prints `0.1.0`
+- [ ] `python -c "import galaxymem; print(galaxymem.__version__)"` prints `0.1.1`
 - [ ] If Hermes: `GalaxyMemProvider` is not `None` when imported inside Hermes
 - [ ] If standalone: `GalaxyMemProvider` is `None` (expected, not an error)
-- [ ] `pytest galaxymem/tests/ -q` shows the full suite passing (currently ~229 tests; exact count grows as tests are added)
+- [ ] `pytest galaxymem/tests/ -q` shows the full suite passing (currently ~294 tests; exact count grows as tests are added)
 - [ ] The viewer starts: `python -c "from galaxymem.viewer.app import run_viewer; run_viewer()"`
 - [ ] The DB path is writable and has disk space (~500MB headroom)
