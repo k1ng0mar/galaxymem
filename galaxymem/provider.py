@@ -626,12 +626,22 @@ class GalaxyMemProvider(MemoryProvider):
                 pass
             self._store = None
 
-        # Initialize the Store
+        # Initialize the Store — backend selectable via GALAXYMEM_BACKEND
+        # ('sqlite' default for new installs; 'lancedb' legacy fallback).
         try:
-            from .store import Store
-            self._store = Store(db_path=Path(self._db_path))
+            backend = (os.environ.get("GALAXYMEM_BACKEND") or "lancedb").strip().lower()
+            if backend == "sqlite":
+                from .store_sqlite import Store
+                # SQLite backend uses a single .db file
+                db_file = Path(self._db_path)
+                if db_file.is_dir() or str(self._db_path).endswith(("db", "db/")):
+                    db_file = db_file.parent / "galaxymem.sqlite3"
+                self._store = Store(db_path=db_file)
+            else:
+                from .store import Store
+                self._store = Store(db_path=Path(self._db_path))
             self._store.open(create_if_missing=True)
-            logger.info("GalaxyMem store opened at %s", self._db_path)
+            logger.info("GalaxyMem store opened at %s (backend=%s)", self._db_path, backend)
         except Exception as e:
             logger.error("GalaxyMem store init failed: %s", e)
             self._store = None
