@@ -45,6 +45,7 @@ class EdgeKind(str, Enum):
     derived_from = "derived_from"
     supersedes = "supersedes"
     contests = "contests"
+    caused_by = "caused_by"
 
 
 # ── Core tables ──────────────────────────────────────────────────────────
@@ -86,6 +87,11 @@ class MemoryRecord(BaseModel):
     evidence_quotes: list[str] = Field(default_factory=list)
     # Change history as a JSON-encoded list of {at, action, sources} entries.
     history_json: Optional[str] = None
+    # When the event described actually happened (if knowable), as opposed to
+    # created_at (when we learned it). "Alice got married in June 2024" was
+    # learned in 2025 but occurred in 2024. Temporal queries rank by
+    # occurred_at when present, falling back to created_at.
+    occurred_at: Optional[datetime] = None
 
 
 class SessionSummary(BaseModel):

@@ -315,11 +315,22 @@ Return ONLY JSON:
       "reason": "brief explanation",
       "status_line": "optional: one-line current status for the entity after this update"
     }}
+  ],
+  "causal_links": [
+    {{
+      "cause_id": "id of the memory describing the cause",
+      "effect_id": "id of the memory describing the effect",
+      "reason": "brief explanation of the causal mechanism"
+    }}
   ]
 }}
 
+Only report a causal link when the memories state or clearly imply that one
+thing caused the other — not mere co-occurrence. If none, return an empty list.
+
 If nothing conflicts, return {{"conflicts": []}}.
-"""
+
+{bank_identity}"""
 
 
 def _resolve_conflicts_for_entity(
@@ -343,6 +354,7 @@ def _resolve_conflicts_for_entity(
     prompt = _CONFLICT_PROMPT.format(
         entity_id=prompt_escape(entity_id, max_len=80),
         memory_lines=memory_lines,
+        bank_identity=cfg.bank_identity_block(),
     )
 
     try:
@@ -353,6 +365,20 @@ def _resolve_conflicts_for_entity(
 
     analysis = _parse_json_object(response, {"conflicts": []})
     records: list[ReflectionRecord] = []
+
+    # Causal links: cause→effect edges spotted during conflict analysis.
+    # The LLM reads every memory pair anyway; recording the causal claims it
+    # notices is free and makes "why did this happen?" queries possible.
+    for link in analysis.get("causal_links", []):
+        cause = by_id.get(link.get("cause_id"))
+        effect = by_id.get(link.get("effect_id"))
+        if cause is None or effect is None or cause.id == effect.id:
+            continue  # never act on ids the LLM invented
+        weight = 0.8  # causal inference is strong but not firsthand
+        store.add_edge(EdgeRecord(from_id=effect.id, to_id=cause.id,
+                                  kind=EdgeKind.caused_by, weight=weight))
+        report.setdefault("causal_links_added", 0)
+        report["causal_links_added"] += 1
 
     for conflict in analysis.get("conflicts", []):
         old_id = conflict.get("old_memory_id")
@@ -504,6 +530,8 @@ For evidence_quotes, use EXACT verbatim text from the source memories (a short
 distinctive substring of each source). Do not paraphrase.
 
 If no new pattern is clearly supported, return {{"opinions": []}}.
+
+{bank_identity}
 """
 
 
@@ -530,6 +558,7 @@ def _form_opinions_for_entity(store, llm_client: LLMClient, entity_id: str,
         memory_lines="\n".join(f"[{m.id}] {prompt_escape(m.text, max_len=400)}" for m in basis),
         opinion_lines="\n".join(f"- {prompt_escape(o.text, max_len=400)}" for o in existing) or "(none)",
         min_sources=_MIN_OPINION_SOURCES,
+        bank_identity=cfg.bank_identity_block(),
     )
 
     try:

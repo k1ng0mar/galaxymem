@@ -118,6 +118,24 @@ def get_hot_cache(store: Store, entity_ids: Optional[list[str]] = None) -> list[
     return result
 
 
+def fit_to_token_budget(memories: list[MemoryRecord], max_tokens: int) -> list[MemoryRecord]:
+    """Trim a ranked memory list to a rough token budget (1 token ≈ 4 chars).
+
+    Used by gm_recall so agents can size context precisely — the agent thinks
+    in tokens, not in result counts. The first item is always kept even if it
+    alone exceeds the budget.
+    """
+    result: list[MemoryRecord] = []
+    used = 0
+    for mem in memories:
+        est = len(mem.text) // 4 + 1
+        if result and used + est > max_tokens:
+            break
+        result.append(mem)
+        used += est
+    return result
+
+
 def update_hot_cache(store: Store, entity_id: Optional[str] = None) -> HotCache:
     """Refresh the hot cache and persist it to the store.
 
@@ -265,6 +283,7 @@ def deep_recall(
     limit: Optional[int] = None,
     use_spreading: bool = True,
     as_of: Optional[datetime] = None,
+    max_tokens: Optional[int] = None,
 ) -> list[MemoryRecord]:
     """Deep recall per Phase 4 of the spec.
 
@@ -281,6 +300,10 @@ def deep_recall(
        co-recalled edge weights up.
     8. Temporal mode (`as_of`): same pipeline against the historical store,
        no touching, no edge writes, superseded included.
+
+    When `max_tokens` is set, the final list is trimmed to a rough token
+    budget (1 token ≈ 4 chars) — agents size context in tokens, not counts.
+    `limit` still caps hard; the budget only shrinks the list further.
 
     Returns:
         List of MemoryRecord, ranked by combined score.
@@ -465,6 +488,8 @@ def deep_recall(
             query, f" as of {as_of.isoformat()}" if temporal else "",
             len(candidates), len(results),
         )
+        if max_tokens is not None and max_tokens > 0:
+            results = fit_to_token_budget(results, max_tokens)
         return results
     finally:
         # Close the temporal store's table handle to prevent fd leak.
@@ -530,6 +555,7 @@ def recall(
     entity_ids: Optional[list[str]] = None,
     limit: Optional[int] = None,
     as_of: Optional[datetime] = None,
+    max_tokens: Optional[int] = None,
 ) -> list[MemoryRecord]:
     """Main recall function — deep recall with hot cache update.
 
@@ -543,11 +569,13 @@ def recall(
         entity_ids: Optional entity filter.
         limit: Max memories to return.
         as_of: Optional timestamp for temporal recall.
+        max_tokens: Optional rough token budget for the result list.
 
     Returns:
         List of MemoryRecord ranked by relevance.
     """
-    results = deep_recall(query, store, entity_ids=entity_ids, limit=limit, as_of=as_of)
+    results = deep_recall(query, store, entity_ids=entity_ids, limit=limit,
+                          as_of=as_of, max_tokens=max_tokens)
 
     if as_of is None:
         # Refresh hot cache after recall (recall_count has changed)

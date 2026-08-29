@@ -403,6 +403,7 @@ Return your answer as a JSON array of objects. Each object has:
   "network": "world|experience|opinion|observation",
   "entity_labels": ["label1", "label2"],
   "canonical_key": "subject|predicate|object",  // optional but HIGHLY encouraged
+  "occurred_at": "YYYY-MM-DD or full ISO timestamp",  // optional: when the event itself happened, if the text states it (e.g. "got married in June 2024" -> "2024-06"). Omit for ongoing facts/preferences.
   "memory_ids": ["flag_id_1"]  // optional; flag_id(s) this memory came from
 }
 
@@ -417,7 +418,7 @@ Return a JSON array of extracted memories."""
 
 
 def _normalize_canonical_key(key: str) -> str:
-    """Normalize a canonical_key to the standard format.
+    """Normalize a canonical fact key for consistent deduplication.
 
     Format: "subject|predicate|object" — three parts, lowercase, no spaces
     within each (use hyphens), stripped of excess whitespace and punctuation.
@@ -443,6 +444,27 @@ def _normalize_canonical_key(key: str) -> str:
         p = p.strip('-')
         cleaned.append(p[:64])  # cap component length
     return "|".join(cleaned)
+
+
+def _parse_occurred_at(raw) -> Optional[datetime]:
+    """Coerce a free-form LLM-provided date into a UTC datetime.
+
+    Accepts ISO timestamps and YYYY-MM / YYYY-MM-DD. Returns None for empty,
+    malformed, or future-only-Plausible values — the store falls back to
+    created_at when this is None.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _sanitize_turn_text(turn_text: str) -> str:
@@ -683,6 +705,10 @@ def _process_batch(
             if canonical_key is not None:
                 canonical_key = _normalize_canonical_key(canonical_key)
 
+            # Occurred_at: optional, only when the LLM could extract a real date
+            # from the memory text. Falls through to None for ongoing facts.
+            occurred_at = _parse_occurred_at(item.get("occurred_at"))
+
             # Canonization pass: if this fact was already stored under the
             # same canonical_key, merge into the existing memory instead of
             # creating a duplicate. Source flag ids get appended; the most
@@ -741,6 +767,7 @@ def _process_batch(
                 speaker_entity_id=speaker_entity_id,
                 flagged_source=source_flag.flag_reason,
                 canonical_key=canonical_key,
+                occurred_at=occurred_at,
             )
             store.add_memory(memory)
             new_memories.append(memory)
