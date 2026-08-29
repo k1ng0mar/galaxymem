@@ -9,7 +9,7 @@ you're contributing, start here; if you're just using it, the README is enough.
 ## The one-paragraph version
 
 A memory *turn* flows through a two-pass pipeline (cheap rule-based flagging →
-batched LLM extraction) into a LanceDB store. At recall time, a hybrid
+batched LLM extraction) into a single SQLite database. At recall time, hybrid
 vector+keyword search is fused (RRF), boosted by decay, and expanded through
 one-hop graph activation. Periodically, a reflection pass repairs the store
 (contradictions, supersession, opinion formation). Everything is scoped to
@@ -32,11 +32,11 @@ GalaxyMem is deliberately split into **storage**, **records**, **logic**, and
         │                │                │
         └────────────────┼────────────────┘
                          ▼
-                      store.py  ← storage: CRUD, search, edges, stats
+                   store_sqlite.py  ← storage: DDL, CRUD, search, edges, stats
                          │
               ┌──────────┼──────────┐
               ▼          ▼          ▼
-         schema.py   models.py   config.py   ← data + tunables (leaf modules)
+          embed.py    models.py   config.py   ← data + tunables (leaf modules)
 ```
 
 | Module | Responsibility | Depends on |
@@ -44,21 +44,41 @@ GalaxyMem is deliberately split into **storage**, **records**, **logic**, and
 | `config.py` | All tunables, env-overridable | `sanitize` (env parsers) |
 | `sanitize.py` | Prompt/YAML/JSON/path sandbox helpers | nothing |
 | `models.py` | Pydantic record types (Memory, Entity, Edge, Identity) | `config` |
-| `schema.py` | LanceDB `LanceModel` table definitions + `_esc` | `config` |
-| `store.py` | The `Store` class: CRUD, vector/keyword search, edges, hot cache, flags, stats, versioning | `schema`, `models`, `config`, `redact` |
-| `entities.py` | Entity CRUD, provisional provisioning, slug resolution | `store`, `models` |
-| `identity.py` | Platform↔entity link resolution | `store`, `models` |
-| `retain.py` | Pass 1 flag rules + Pass 2 LLM extraction | `store`, `entities`, `models`, `config` |
-| `recall.py` | `deep_recall`, RRF fusion, spreading activation, hot cache | `store`, `models`, `config` |
-| `reflect.py` | Supersession, contradiction, opinion formation, cascades | `store`, `models`, `config` |
-| `promote.py` | Export high-value memories to vault/wiki (human-gated) | `store`, `models`, `config` |
+| `embed.py` | Embeddings: fastembed with a deterministic hash fallback | `config` |
+| `store_sqlite.py` | SQLite storage: DDL, CRUD, vector + FTS5 keyword search, edges, flags, hot cache, stats | `config`, `models`, `embed`, `redact` |
+| `entities.py` | Entity CRUD, provisional provisioning, slug resolution | `store_sqlite`, `models` |
+| `identity.py` | Platform↔entity link resolution | `store_sqlite`, `models` |
+| `retain.py` | Pass 1 flag rules + Pass 2 LLM extraction | `store_sqlite`, `entities`, `models`, `config` |
+| `recall.py` | `deep_recall`, RRF fusion, spreading activation, hot cache | `store_sqlite`, `models`, `config` |
+| `reflect.py` | Supersession, contradiction, opinion formation, cascades | `store_sqlite`, `models`, `config` |
+| `promote.py` | Export high-value memories to vault/wiki (human-gated) | `store_sqlite`, `models`, `config` |
 | `provider.py` | Hermes `MemoryProvider` impl: tool schemas, `initialize()`, prefetch | everything above |
 
-**Key rule:** `store.py` contains *zero* business logic — it moves rows in and
-out of LanceDB and runs searches. All "what should we remember / what does this
-mean" logic lives in `retain.py` / `recall.py` / `reflect.py`. This is why
-`store.py` is the largest file but the easiest to reason about: it has no
-branching on meaning, only on data shape.
+**Key rule:** `store_sqlite.py` contains *zero* business logic — it moves rows
+in and out of SQLite and runs searches. All "what should we remember / what
+does this mean" logic lives in `retain.py` / `recall.py` / `reflect.py`. This
+is why the store is the largest file but the easiest to reason about: it has
+no branching on meaning, only on data shape.
+
+---
+
+## The storage layer
+
+One SQLite file holds nine tables (memories, entities, identity_links, edges,
+hot_cache, flags, promotion_queue, session_summaries) plus two virtual tables:
+
+- **`memories_fts` (FTS5)** — keyword search with the porter tokenizer. FTS5
+  indexes update in the same transaction as the row insert, so keyword search
+  can never miss a recently stored memory.
+- **`memories_vec` (sqlite-vec)** — the embedding column as a `vec0` virtual
+  table. sqlite-vec is loaded at open time when available; without it the
+  store falls back to in-Python cosine over the vector blobs, which is fast
+  enough at personal-memory scale.
+
+Every write that touches multiple tables (memory + FTS + vector + edges) is
+wrapped in a single transaction. A crash mid-write rolls back completely —
+the store never holds half a memory. WAL mode allows concurrent readers with
+a single writer.
 
 ---
 
@@ -152,7 +172,7 @@ Runs when ≥`REFLECT_VOLUME_TRIGGER` (100) new memories accumulate, or on deman
 5. **Entity nomination** — names that recur but aren't linked get nominated for
    explicit `gm_create_entity`.
 
-### Promotion (`gm_promote` / session end)
+### Promotion (session end)
 
 High-confidence memories (≥`PROMOTION_MIN_RECALLS` recalls, ≥`PROMOTION_MIN_CYCLES`
 reflection cycles) are written as `workflow:draft` proposal notes into the vault
@@ -178,8 +198,14 @@ motivated it.
 - **D13 — Never hard-delete.** `delete_memory` is a soft `archived` status.
   Memory bugs are silent; being able to audit "what did it used to believe" is
   the only recourse.
-- **Store has no business logic (separation of concerns).** Makes `store.py`
+- **Store has no business logic (separation of concerns).** Makes the store
   testable without an LLM and lets `recall`/`reflect` evolve independently.
+- **SQLite parameterized queries only.** All user-supplied values go through
+  `?` placeholders, never string concatenation. The injection-vuln class that
+  string-built filters invite is structurally absent.
+- **Prompt-injection guard on recall output.** Memories are data, not
+  instructions: `format_memories_for_prompt` neutralizes instruction-shaped
+  spans and labels memories as historical data before they enter a prompt.
 
 ---
 
@@ -189,17 +215,20 @@ motivated it.
 
 | Test file | Covers |
 |---|---|
-| `test_store.py` | CRUD, search, edges, versioning, compaction |
+| `test_store.py` | CRUD, search, edges, limits |
 | `test_entities.py` | Entity CRUD, provisioning, merge |
 | `test_identity.py` | Platform↔entity link resolution |
-| `test_retrieval.py` | `deep_recall`, RRF, spreading activation |
+| `test_retrieval.py` | `deep_recall`, RRF, spreading activation, latency |
 | `test_reflect_root.py` | Supersession, contradiction, opinion cascades |
 | `test_retain_root.py` | Flag→extract flow, dedup, LLM-failure handling |
 | `test_promote.py` | Promotion queue + vault draft writing |
 | `test_e2e.py` | Full pipeline: flag → extract → recall → reflect |
+| `test_audit_fixes.py` | Security hardening: injection guards, batching, atomicity |
+| `test_hardening.py` | Env clamping, path sandbox, JSON parsing |
 | `test_spec_regressions.py` | Schema/contract stability guards |
 
 Run with: `pytest galaxymem/tests/ -v` (after `pip install -e ".[dev]"`).
+Current suite: 282 passed, 2 skipped.
 
 ---
 
@@ -207,11 +236,11 @@ Run with: `pytest galaxymem/tests/ -v` (after `pip install -e ".[dev]"`).
 
 - **New memory source?** Add a flag rule in `retain.flag_turn()` — no other
   changes needed; Pass 2 + store handle the rest.
-- **New recall signal?** Add a search method to `store.py`, fuse it in
+- **New recall signal?** Add a search method to the store, fuse it in
   `recall.deep_recall()` via RRF.
 - **New reflection rule?** Add a function in `reflect.py` and call it from
   `run_reflection()`.
 - **New Hermes tool?** Add a schema dict in `provider.py` + a handler method.
-  The tool auto-registers (12 tools currently).
-- **Standalone (no Hermes)?** Use `store.Store` + `retain`/`recall`/`reflect`
-  directly. `provider.py` is the only Hermes-coupled module.
+  The tool auto-registers (16 tools currently).
+- **Standalone (no Hermes)?** Use `store_sqlite.Store` + `retain`/`recall`/
+  `reflect` directly. `provider.py` is the only Hermes-coupled module.

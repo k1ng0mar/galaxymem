@@ -1,1 +1,0 @@
-# GalaxyMem test suite
