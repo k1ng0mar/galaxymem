@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from galaxymem.models import MemoryRecord, MemoryStatus, Network
 from galaxymem.reflect import _merge_into_existing_opinion, _form_opinions_for_entity
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 class StubLLM:

@@ -1,11 +1,11 @@
 """GalaxyMem — entity-scoped memory provider for AI agents.
 
-LanceDB-backed, four-network epistemic split, decay-based relevance,
+SQLite-backed, four-network epistemic split, decay-based relevance,
 autonomous reflection. Built for Hermes Agent but usable standalone.
 """
 
 PACKAGE_NAME = "galaxymem"
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 # `provider` is the ONLY Hermes-coupled module — it imports agent.* / tools.*
 # at module load. Guard it so the engine (store / retain / recall / reflect /
@@ -15,7 +15,7 @@ try:  # pragma: no cover - depends on host environment
 except ImportError:
     GalaxyMemProvider = None  # type: ignore[assignment]
 
-from .store import Store
+from .store_sqlite import Store
 from .models import (
     MemoryRecord,
     EntityRecord,

@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from .models import MemoryRecord, MemoryStatus, Network
 from .sanitize import parse_json_object, prompt_escape
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 

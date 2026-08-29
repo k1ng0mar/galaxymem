@@ -16,7 +16,7 @@ from typing import Optional
 
 from .redact import redact_secrets
 from .sanitize import prompt_escape
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,13 @@ def update_summary(
 ) -> None:
     """Append a turn to the rolling session summary, compressing if needed."""
     existing = get_summary(store, session_id)
-    old_text = existing["text"] if existing else ""
+    # Backends may return dict-like rows (LanceDB) or Pydantic objects (SQLite)
+    if existing is None:
+        old_text = ""
+    elif isinstance(existing, dict):
+        old_text = existing.get("text") or ""
+    else:
+        old_text = existing.text or ""
 
     user_message = redact_secrets(user_message or "")
     assistant_message = redact_secrets(assistant_message or "")
@@ -53,13 +59,25 @@ def update_summary(
             else:
                 new_text = merged[-_SUMMARY_MAX_CHARS:]
 
-    count = (existing["message_count"] + 1) if existing else 1
+    if existing is None:
+        count = 1
+    elif isinstance(existing, dict):
+        count = (existing.get("message_count") or 0) + 1
+    else:
+        count = (existing.message_count or 0) + 1
     store.upsert_session_summary(session_id, new_text, count)
 
 
 def get_summary(store: Store, session_id: str) -> Optional[dict]:
-    """Get the current summary for a session, or None."""
-    return store.get_session_summary(session_id)
+    """Get the current summary for a session, or None.
+
+    Normalizes to a plain dict regardless of backend (SQLite returns
+    SessionSummary objects; LanceDB returned dict-like rows).
+    """
+    raw = store.get_session_summary(session_id)
+    if raw is None:
+        return None
+    return raw if isinstance(raw, dict) else raw.model_dump(mode="json")
 
 
 def list_summaries(store: Store, limit: int = 50) -> list[dict]:
@@ -76,14 +94,20 @@ def search_sessions_by_text(store: Store, query: str, limit: int = 10) -> list[d
 
     results = []
     for s in all_summaries:
-        if not s["text"]:
+        # Backend-agnostic field access (dict rows or SessionSummary objects)
+        text = s.get("text") if isinstance(s, dict) else s.text
+        if not text:
             continue
-        stext = s["text"].lower()
+        stext = (text or "").lower()
         overlap = sum(1 for w in qwords if w in stext)
         if overlap >= max(1, len(qwords) // 2):
             results.append((overlap, s))
     results.sort(key=lambda x: x[0], reverse=True)
-    return [s for _, s in results[:limit]]
+    out = []
+    for _, s in results[:limit]:
+        # Normalize to dict (LanceDB returned dict rows; SQLite returns objects)
+        out.append(s if isinstance(s, dict) else s.model_dump(mode="json"))
+    return out
 
 
 def _llm_compress(old_text: str, new_text: str, llm_fn) -> str:

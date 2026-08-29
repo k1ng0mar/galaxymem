@@ -31,7 +31,7 @@ class FakeLLM:
 
 
 def _mem(text: str, network=Network.world, entity_ids=None, source_ids=None):
-    from galaxymem.store import _ulid
+    from galaxymem.store_sqlite import _ulid
     return MemoryRecord(
         id=_ulid(),
         text=text,

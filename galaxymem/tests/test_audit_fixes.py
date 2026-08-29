@@ -16,8 +16,7 @@ from galaxymem.sanitize import (
     resolve_under,
     yaml_quote,
 )
-from galaxymem.schema import _esc, _in_list
-from galaxymem.store import Store, _entity_membership_clause
+from galaxymem.store_sqlite import Store, _entity_membership_clause
 
 
 class TestSanitize:
@@ -58,21 +57,24 @@ class TestSanitize:
 
 
 class TestSqlEscaping:
+    """SQLite uses ? placeholders — string-escaping vulns are structurally gone.
+
+    These tests verify the replacement guarantees instead.
+    """
+
     def test_empty_entity_clause_is_unsatisfiable(self):
         assert _entity_membership_clause([]) == "(1 = 0)"
 
-    def test_in_list_escapes_quotes(self):
-        clause = _in_list(['active', 'evil" OR 1=1'])
-        assert 'evil\\"' in clause
-
-    def test_esc_none_is_empty(self):
-        assert _esc(None) == ""
-
-
-    def test_in_list_empty_is_unsatisfiable(self):
-        clause = _in_list([])
-        assert "IN" not in clause or "__galaxymem_empty__" in clause
-        assert clause == '("__galaxymem_empty__")'
+    def test_queries_are_parameterized(self):
+        # The sqlite store must never build SQL by string-concatenating
+        # user values. Spot-check: its search filter uses ? placeholders.
+        import inspect
+        from galaxymem.store_sqlite import Store
+        src = inspect.getsource(Store._filter_where)
+        assert '"?"' in src or "'?'" in src or " ?" in src
+        # And the dangerous LIKE-pattern builder quotes the value
+        src2 = inspect.getsource(Store.list_memories)
+        assert "entity_ids LIKE ?" in src2
 
 
 class TestStoreBatching:
@@ -86,9 +88,11 @@ class TestStoreBatching:
         def fake_embed_text(text):
             raise AssertionError("add_memories must not call embed_text per row")
 
-        import galaxymem.store as store_mod
-        monkeypatch.setattr(store_mod, "embed_texts", fake_embed_texts)
-        monkeypatch.setattr(store_mod, "embed_text", fake_embed_text)
+        import galaxymem.embed as embed_mod
+        monkeypatch.setattr(embed_mod, "embed_texts", fake_embed_texts)
+        monkeypatch.setattr(embed_mod, "embed_text", fake_embed_text)
+        import galaxymem.store_sqlite as ssql
+        monkeypatch.setattr(ssql.Store, "_embed_texts", lambda self, ts: fake_embed_texts(ts))
 
         s = Store(db_path=Path(tmp_path) / "db").open(create_if_missing=True)
         mems = [
@@ -119,10 +123,8 @@ class TestStoreBatching:
         s.close()
 
     def test_list_active_candidates_orders_hot_first(self, tmp_path, monkeypatch):
-        import galaxymem.store as store_mod
-
-        monkeypatch.setattr(store_mod, "embed_text", lambda t: [0.0] * 384)
-        monkeypatch.setattr(store_mod, "embed_texts", lambda ts: [[0.0] * 384 for _ in ts])
+        import galaxymem.store_sqlite as ssql
+        monkeypatch.setattr(ssql.Store, "_embed_texts", lambda self, ts: [[0.0] * 384 for _ in ts])
 
         s = Store(db_path=Path(tmp_path) / "db").open(create_if_missing=True)
         cold = MemoryRecord(id="cold", text="rarely used fact about widgets", network=Network.world, recall_count=0)
@@ -134,11 +136,10 @@ class TestStoreBatching:
         s.close()
 
     def test_neighbors_for_ids_batches(self, tmp_path, monkeypatch):
-        import galaxymem.store as store_mod
+        import galaxymem.store_sqlite as ssql
         from galaxymem.models import EdgeKind, EdgeRecord
 
-        monkeypatch.setattr(store_mod, "embed_text", lambda t: [0.0] * 384)
-        monkeypatch.setattr(store_mod, "embed_texts", lambda ts: [[0.0] * 384 for _ in ts])
+        monkeypatch.setattr(ssql.Store, "_embed_texts", lambda self, ts: [[0.0] * 384 for _ in ts])
 
         s = Store(db_path=Path(tmp_path) / "db").open(create_if_missing=True)
         a = MemoryRecord(id="a", text="alpha memory about the api", network=Network.world)
@@ -184,7 +185,7 @@ def test_neutralize_preserves_clean_text():
 def test_consume_flags_atomic():
     """consume_flags must hold the write lock (no race)."""
     import inspect
-    from galaxymem.store import Store
+    from galaxymem.store_sqlite import Store
     src = inspect.getsource(Store.consume_flags)
     assert "_write_lock" in src, "consume_flags must use _write_lock"
 

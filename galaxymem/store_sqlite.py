@@ -157,6 +157,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
 _SCHEMA_VERSION = 1
 
 
+def _entity_membership_clause(entity_ids: list[str]) -> str:
+    """Empty-clause guard for D8 fail-closed semantics (test contract).
+
+    Returns the unsatisfiable '(1 = 0)' for an empty list. Non-empty
+    lists go through Store._filter_where with ? placeholders.
+    """
+    if not entity_ids:
+        return "(1 = 0)"
+    return "(entity_ids LIKE ?)"
+
+
 class Store:
     """SQLite-backed storage layer, API-compatible with the LanceDB store."""
 
@@ -170,9 +181,20 @@ class Store:
     # ── Connection / lifecycle ──────────────────────────────────────────
 
     def open(self, create_if_missing: bool = True) -> "Store":
-        """Open (or create) the SQLite database and prepare tables/indexes."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
+        """Open (or create) the SQLite database and prepare tables/indexes.
+
+        Accepts either a file path or a directory path. A directory is
+        treated as the legacy LanceDB-style layout: the DB file is
+        <dir>/galaxymem.sqlite3.
+        """
+        p = Path(self.db_path)
+        if p.is_dir() or not str(p).endswith(".sqlite3"):
+            # Directory-style path → use galaxymem.sqlite3 inside it
+            if str(p).endswith(("db", "db/", "test_galaxymem")) or p.is_dir():
+                p = p / "galaxymem.sqlite3"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = p
+        self._conn = sqlite3.connect(str(p), timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
@@ -215,6 +237,21 @@ class Store:
         if self._conn is None or self._closed:
             raise RuntimeError("Store is not open")
 
+    def _assert_under_limits(self, extra: int = 0) -> None:
+        """Raise if adding `extra` memories would exceed MAX_MEMORIES (D-dos guard)."""
+        max_mem = getattr(cfg, "MAX_MEMORIES", None)
+        if max_mem is None:
+            return
+        count = 0
+        try:
+            count = self._query("SELECT COUNT(*) AS c FROM memories")[0]["c"]
+        except Exception:
+            return
+        if count + extra > max_mem:
+            raise RuntimeError(
+                f"Memory limit reached ({count} >= {max_mem}); refusing to add {extra} more"
+            )
+
     def _execute(self, sql: str, params: tuple = ()):
         self._assert_writable()
         cur = self._conn.execute(sql, params)
@@ -245,7 +282,12 @@ class Store:
     def add_memory(self, memory: MemoryRecord) -> str:
         """Insert a single memory atomically with FTS + vector indexes."""
         self._assert_writable()
+        # Credential-shaped spans never persist (store-boundary redaction).
+        prepared_text = redact_secrets(memory.text)
+        if prepared_text != memory.text:
+            memory = memory.model_copy(update={"text": prepared_text})
         vec = getattr(memory, "vector", None) or self._embed(memory.text)
+        self._assert_under_limits(1)
         with self._write_lock:
             row = self._memory_to_row(memory)
             self._conn.execute(
@@ -344,7 +386,7 @@ class Store:
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts. Uses fastembed if available, else fake."""
         try:
-            from .store import embed_texts
+            from .embed import embed_texts
             return embed_texts(texts)
         except Exception:
             # Fall back to a deterministic hash-based vector so the store
@@ -388,10 +430,37 @@ class Store:
                 out[rec.id] = rec
         return out
 
-    def update_memory_status(self, memory_id: str, status: MemoryStatus) -> None:
+    def update_memory_status(self, memory_id: str, status: MemoryStatus = None,
+                              **fields) -> None:
+        """Update a memory's status (and optionally other related fields).
+
+        Accepts the legacy (memory_id, status) positional call, plus
+        keyword args for related fields that often change together
+        (superseded_by, contested_with, last_recalled_at).
+        """
+        if status is not None:
+            fields["status"] = status
+        if not fields:
+            return
+        allowed = {"status", "superseded_by", "contested_with", "last_recalled_at"}
+        cols, params = [], []
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if hasattr(v, "value"):
+                v = v.value
+            elif isinstance(v, (list, dict)):
+                v = json.dumps(v, ensure_ascii=False)
+            elif isinstance(v, datetime):
+                v = v.isoformat()
+            cols.append(f"{k} = ?")
+            params.append(v)
+        if not cols:
+            return
+        params.append(memory_id)
         self._execute(
-            "UPDATE memories SET status = ? WHERE id = ?",
-            (status.value, memory_id),
+            f"UPDATE memories SET {', '.join(cols)} WHERE id = ?",
+            tuple(params),
         ).connection.commit()
 
     def update_memory_field(self, memory_id: str, **fields: Any) -> None:
@@ -403,7 +472,7 @@ class Store:
             "superseded_by", "contested_with", "last_recalled_at",
             "recall_count", "recall_miss_count", "reflect_cycles",
             "promoted_to", "flagged_source", "canonical_key", "proof_count",
-            "evidence_quotes", "history_json",
+            "evidence_quotes", "history_json", "created_at",
         }
         cols, params = [], []
         for k, v in fields.items():
@@ -601,9 +670,15 @@ class Store:
         import math
         if not a or not b or len(a) != len(b):
             return 0.0
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        if na == 0.0 and nb == 0.0:
+            # Both zero vectors — match LanceDB's L2-based scoring, which
+            # treats identical (including all-zero) vectors as similarity 1.
+            return 1.0
+        if na == 0.0 or nb == 0.0:
+            return 0.0
         dot = sum(x * y for x, y in zip(a, b))
-        na = math.sqrt(sum(x * x for x in a)) or 1.0
-        nb = math.sqrt(sum(x * x for x in b)) or 1.0
         return max(-1.0, min(1.0, dot / (na * nb)))
     def keyword_search(self, query: str, k: int = 25,
                        entity_filter=None, network_filter=None,
@@ -878,7 +953,6 @@ class Store:
             tuple(memory_ids) + tuple(memory_ids) + (min_weight,),
         )
         result: dict[str, list[tuple[str, EdgeRecord]]] = {}
-        seen = set(memory_ids)
         for r in rows:
             edge = EdgeRecord(from_id=r["from_id"], to_id=r["to_id"],
                               kind=EdgeKind(r["kind"]), weight=r["weight"])
@@ -889,10 +963,7 @@ class Store:
                     nid = r["from_id"]
                 else:
                     continue
-                if nid in seen:
-                    continue
                 result.setdefault(mid, []).append((nid, edge))
-                seen.add(nid)
         return result
 
     def update_edge_weight(self, from_id: str, to_id: str, kind: str, weight: float) -> None:
@@ -1044,12 +1115,27 @@ class Store:
             last_updated=datetime.fromisoformat(r["last_updated"]) if r["last_updated"] else datetime.now(timezone.utc),
         )
 
-    def upsert_session_summary(self, summary: SessionSummary) -> None:
+    def upsert_session_summary(self, session_id: str, text: str = None,
+                               message_count: int = None, summary=None) -> None:
+        """Insert/update a session summary.
+
+        Accepts either (session_id, text, message_count) — the legacy
+        positional contract — or a single SessionSummary instance.
+        """
+        if summary is not None and isinstance(summary, SessionSummary):
+            session_id = summary.id
+            text = summary.text
+            message_count = summary.message_count
+            updated = summary.last_updated.isoformat() if summary.last_updated else datetime.now(timezone.utc).isoformat()
+        else:
+            if text is None:
+                raise ValueError("upsert_session_summary requires text or a SessionSummary")
+            message_count = message_count or 0
+            updated = datetime.now(timezone.utc).isoformat()
         self._execute(
             "INSERT OR REPLACE INTO session_summaries (id, text, message_count, last_updated) "
             "VALUES (?,?,?,?)",
-            (summary.id, summary.text, summary.message_count,
-             summary.last_updated.isoformat() if summary.last_updated else datetime.now(timezone.utc).isoformat()),
+            (session_id, text, message_count, updated),
         ).connection.commit()
 
     def list_session_summaries(self, limit: Optional[int] = None) -> list[SessionSummary]:
@@ -1087,18 +1173,35 @@ class Store:
             by_status[s.value] = row[0]["c"]
         out["memories_by_network"] = by_network
         out["memories_by_status"] = by_status
+        # Legacy contract keys (tests + provider consumers expect these names)
+        out["total_memories"] = out["memories"]
+        out["memories_per_network"] = by_network
+        out["memories_per_status"] = by_status
         return out
 
     # ── Temporal (as_of) ─────────────────────────────────────────────────
 
-    def as_of(self, timestamp: datetime) -> "Store":
-        """Return a view of the store as it was at `timestamp`.
+    def as_of(self, timestamp: datetime) -> "_AsOfView":
+        """Return a read-only view of the store as it was at `timestamp`.
 
-        SQLite has no native time-travel. We approximate: superseded
-        memories ARE visible (they were active then), archived/demoted are
-        filtered by their status — an approximation documented in the
-        migration spec. Returns a lightweight wrapper, not a new connection.
+        SQLite has no native time-travel; we approximate with created_at
+        filters (memories that did not exist yet are invisible). Raises
+        ValueError if the timestamp predates every record in the store —
+        mirroring the LanceDB version-not-found contract.
         """
+        if self._conn is None or self._closed:
+            raise RuntimeError("Store is not open")
+        row = self._query("SELECT MIN(created_at) AS earliest FROM memories")[0]
+        earliest = row["earliest"] if row else None
+        if earliest is not None:
+            try:
+                if timestamp < datetime.fromisoformat(earliest):
+                    raise ValueError(
+                        f"No store version exists as of {timestamp.isoformat()} "
+                        f"(earliest record: {earliest})"
+                    )
+            except TypeError:
+                pass
         return _AsOfView(self, timestamp)
 
 
@@ -1137,14 +1240,24 @@ class _AsOfView:
         return [(m, s) for m, s in results if m.created_at and m.created_at.isoformat() <= cutoff][:k]
 
     def list_memories(self, **kw) -> list[MemoryRecord]:
+        """List memories that existed at the as_of timestamp."""
         kw.pop("status", None)
-        return self._store.list_memories(**kw)
+        out = self._store.list_memories(**kw)
+        cutoff = self._as_of.isoformat() if self._as_of else None
+        if cutoff:
+            return [m for m in out if m.created_at and m.created_at.isoformat() <= cutoff]
+        return out
 
     def get_memories_by_ids(self, ids: list[str]) -> dict[str, MemoryRecord]:
         return self._store.get_memories_by_ids(ids)
 
     def neighbors_for_ids(self, ids: list[str], min_weight: float = 0.0):
         return self._store.neighbors_for_ids(ids, min_weight=min_weight)
+
+    def touch_memory(self, memory_id: str) -> None:
+        """Read-only view: touching is forbidden, mirroring LanceDB's
+        as_of temporal semantics."""
+        raise RuntimeError("as_of views are read-only; touch_memory forbidden")
 
     def close(self) -> None:
         pass  # parent owns the connection

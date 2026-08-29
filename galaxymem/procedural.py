@@ -17,7 +17,7 @@ import logging
 from typing import Optional
 
 from .models import MemoryRecord, MemoryStatus
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 

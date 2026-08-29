@@ -18,7 +18,7 @@ Runs with no approval gate. Each cycle:
     fewer → demoted (revived automatically if re-derived with fresh sources).
 5d. Housekeeping — reflect_cycles incremented on active memories (feeds the
     promotion stability threshold), hot caches rebuilt for touched entities,
-    lance tables compacted daily to prevent version bloat, recurring
+    SQLite WAL journaling handles write durability, recurring
     untracked names nominated for user-approved entity creation (entity
     creation stays explicit per D3).
 
@@ -76,60 +76,12 @@ class LLMClient(Protocol):
 from .utils import ulid as _ulid  # noqa: E402
 
 
-# ── Lance compaction (prevents version bloat) ──────────────────────────────
-
-_COMPACT_INTERVAL = 86400  # 24 hours in seconds
-
-
-def _last_compact_path(store) -> Path:
-    return Path(store.db_path) / "compact_state.json"
-
-
-def _should_compact(store) -> bool:
-    """True if the last lance compaction was > 24h ago (or never run)."""
-    try:
-        raw = _last_compact_path(store).read_text(encoding="utf-8")
-        ts = json.loads(raw).get("last_compact_at", 0)
-        return (time.time() - ts) >= _COMPACT_INTERVAL
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        return True
-
-
-def _save_compact_state(store) -> None:
-    try:
-        _last_compact_path(store).write_text(
-            json.dumps({"last_compact_at": time.time()}),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        logger.warning("Failed to persist compact state: %s", e)
-
-
-def _compact_lance_tables(store) -> None:
-    """Run lance optimize + old-version cleanup on all write-heavy tables.
-
-    LanceDB accumulates a version snapshot per write; without periodic
-    compaction the _versions/ directory grows unbounded (observed 1.7 GB
-    for 87 MB of actual data). This merges fragments and removes versions
-    older than 24 hours.
-    """
-    if not _should_compact(store):
-        return
-    table_names = ["memories", "edges", "flags", "promotion_queue"]
-    for name in table_names:
-        try:
-            tbl = store.db.open_table(name)
-            tbl.optimize(cleanup_older_than=timedelta(hours=24))
-            logger.info("Compacted lance table: %s", name)
-        except Exception as e:
-            logger.warning("Lance compaction failed for %s: %s", name, e)
-    _save_compact_state(store)
-
-
 # ── Reflect state (drives the volume trigger) ──────────────────────────────
 
 def _state_path(store) -> Path:
-    return Path(store.db_path) / "reflect_state.json"
+    db = Path(store.db_path)
+    # db may be the sqlite FILE or a legacy dir; state files live alongside
+    return (db.parent if db.suffix == ".sqlite3" else db) / "reflect_state.json"
 
 
 # Concurrency: only one reflection cycle per store at a time. The lock is
@@ -139,7 +91,8 @@ _LOCK_STALE_SECS = 1800.0  # 30 minutes
 
 
 def _lock_path(store) -> Path:
-    return Path(store.db_path) / "reflect.lock"
+    db = Path(store.db_path)
+    return (db.parent if db.suffix == ".sqlite3" else db) / "reflect.lock"
 
 
 def _acquire_reflect_lock(store) -> bool:
@@ -306,7 +259,6 @@ def _run_reflection_locked(store, llm_client: LLMClient) -> dict[str, Any]:
             logger.info("Cleaned up %d stale provisional entities", cleaned)
             report["provisionals_cleaned"] = cleaned
         _rebuild_hot_caches(store, touched_entities)
-        _compact_lance_tables(store)
         _save_reflect_state(store)
 
         logger.info(

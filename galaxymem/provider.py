@@ -1,6 +1,6 @@
 """GalaxyMem MemoryProvider — entity-scoped memory for Hermes Agent.
 
-LanceDB-backed memory with four-network epistemic split (world / experience /
+SQLite-backed memory with four-network epistemic split (world / experience /
 opinion / observation), decay-based relevance, spreading activation recall,
 autonomous reflection, and promotion to external knowledge bases.
 
@@ -34,7 +34,7 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 # Circuit breaker: after this many consecutive failures, pause calls
-# for cooldown to avoid hammering a broken LanceDB or embedding backend.
+# for cooldown to avoid hammering a broken embedding backend.
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
@@ -520,7 +520,7 @@ GM_EXPLAIN_RECALL_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 class GalaxyMemProvider(MemoryProvider):
-    """GalaxyMem — entity-scoped LanceDB memory with decay and reflection."""
+    """GalaxyMem — entity-scoped SQLite memory with decay and reflection."""
 
     def __init__(self):
         self._config: Optional[dict] = None
@@ -553,9 +553,9 @@ class GalaxyMemProvider(MemoryProvider):
     # -- availability ---------------------------------------------------
 
     def is_available(self) -> bool:
-        """Check if LanceDB and fastembed are importable."""
+        """Check if SQLite and fastembed are importable (assimilated, no LanceDB)."""
         try:
-            import lancedb  # noqa: F401
+            import sqlite3  # noqa: F401
             import fastembed  # noqa: F401
             return True
         except ImportError:
@@ -580,7 +580,7 @@ class GalaxyMemProvider(MemoryProvider):
         return [
             {
                 "key": "db_path",
-                "description": "Path to the GalaxyMem LanceDB database directory",
+                "description": "Path to the GalaxyMem SQLite database",
                 "default": "$HERMES_HOME/galaxymem/db",
                 "env_var": "GALAXYMEM_DB_PATH",
             },
@@ -626,22 +626,16 @@ class GalaxyMemProvider(MemoryProvider):
                 pass
             self._store = None
 
-        # Initialize the Store — backend selectable via GALAXYMEM_BACKEND
-        # ('sqlite' default for new installs; 'lancedb' legacy fallback).
+        # Initialize the Store — SQLite backend (LanceDB removed in 0.2.0).
         try:
-            backend = (os.environ.get("GALAXYMEM_BACKEND") or "lancedb").strip().lower()
-            if backend == "sqlite":
-                from .store_sqlite import Store
-                # SQLite backend uses a single .db file
-                db_file = Path(self._db_path)
-                if db_file.is_dir() or str(self._db_path).endswith(("db", "db/")):
-                    db_file = db_file.parent / "galaxymem.sqlite3"
-                self._store = Store(db_path=db_file)
-            else:
-                from .store import Store
-                self._store = Store(db_path=Path(self._db_path))
+            from .store_sqlite import Store
+            # SQLite backend uses a single .db file
+            db_file = Path(self._db_path)
+            if db_file.is_dir() or str(self._db_path).endswith(("db", "db/")):
+                db_file = db_file.parent / "galaxymem.sqlite3"
+            self._store = Store(db_path=db_file)
             self._store.open(create_if_missing=True)
-            logger.info("GalaxyMem store opened at %s (backend=%s)", self._db_path, backend)
+            logger.info("GalaxyMem store opened at %s (backend=sqlite)", self._db_path)
         except Exception as e:
             logger.error("GalaxyMem store init failed: %s", e)
             self._store = None
@@ -710,43 +704,9 @@ class GalaxyMemProvider(MemoryProvider):
     # -- fragment FD management -------------------------------------------
 
     def _maybe_release_fragment_fds(self) -> None:
-        """Release stale fragment readers without destroying the store.
-
-        LanceDB 0.34 opens lance data fragment readers on every search/query
-        and doesn't reliably close them. Over time these accumulate to the
-        process ulimit. Calling close_lsm_writers() on each table releases
-        the fragment handles WITHOUT destroying the store or invalidating
-        existing references — background threads keep working.
-
-        Thread-safety: acquires _store_lock so concurrent tool calls /
-        background threads don't see a half-refreshed store.
-        """
-        if self._store is None:
-            return
-        with self._store_lock:
-            if self._store is None:
-                return
-            try:
-                # close_lsm_writers is on the LanceTable (sync wrapper) itself
-                for tbl_name in ("memories", "entities", "edges", "hot_cache",
-                                 "flags", "promotion_queue", "identity_links"):
-                    try:
-                        tbl = getattr(self._store, f"_{tbl_name}")
-                        if tbl is not None and hasattr(tbl, "close_lsm_writers"):
-                            tbl.close_lsm_writers()
-                    except Exception as e:
-                        self._warn_on_exc(
-                            f"GalaxyMem fd release failed for {tbl_name}", e)
-                # Periodically force GC to release Python-side references to
-                # lance fragment readers that close_lsm_writers doesn't catch.
-                self._gc_counter += 1
-                if self._gc_counter >= self._gc_interval:
-                    self._gc_counter = 0
-                    import gc
-                    gc.collect()
-                logger.debug("GalaxyMem fragment readers released")
-            except Exception as e:
-                self._warn_on_exc("GalaxyMem fd release failed", e)
+        """SQLite connections don't leak fragment readers — this is a no-op
+        (kept for API compatibility with the old lance-backed store)."""
+        return
 
     # -- system prompt -----------------------------------------------------
 
@@ -1080,7 +1040,7 @@ class GalaxyMemProvider(MemoryProvider):
         """gm_store: manually store a memory."""
         from .models import MemoryRecord, MemoryStatus, Network
         from .entities import ensure_self_entity
-        from .store import _ulid
+        from .utils import ulid as _ulid
 
         text = (args.get("text") or "").strip()
         if not text:

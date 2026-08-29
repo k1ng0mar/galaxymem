@@ -17,7 +17,7 @@ from typing import Optional
 
 from . import config as cfg
 from .models import HotCache, MemoryRecord, MemoryStatus
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ def update_hot_cache(store: Store, entity_id: Optional[str] = None) -> HotCache:
     """Refresh the hot cache and persist it to the store.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         entity_id: Optional entity to scope the cache to. If None, global cache.
 
     Returns:
@@ -205,7 +205,7 @@ def spreading_activation(
     proportional to their edge weight and distance from seeds.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         seed_memory_ids: Starting memory IDs to activate from.
         max_hops: Maximum graph traversal depth.
         decay: Activation decay per hop (default from config ACTIVATION_DAMPING).
@@ -539,7 +539,7 @@ def recall(
 
     Args:
         query: Natural language query.
-        store: The LanceDB store.
+        store: The SQLite store.
         entity_ids: Optional entity filter.
         limit: Max memories to return.
         as_of: Optional timestamp for temporal recall.

@@ -27,7 +27,7 @@ from galaxymem.summaries import (
     update_summary,
 )
 from galaxymem.models import MemoryRecord, Network
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 class TestSummaries:

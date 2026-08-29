@@ -25,3 +25,5 @@ __pycache__/
 .coverage
 htmlcov/
 .coverage.*
+venv/
+scripts/

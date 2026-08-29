@@ -7,7 +7,7 @@ from pathlib import Path
 from galaxymem import config as cfg
 from galaxymem.models import MemoryRecord, Network
 from galaxymem.recall import deep_recall
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 NOW = datetime.now(timezone.utc)
 
