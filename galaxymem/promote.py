@@ -96,18 +96,19 @@ def _proposal_title(memory: MemoryRecord) -> str:
 
 def _proposal_filename(memory: MemoryRecord) -> str:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    short_id = re.sub(r"[^a-zA-Z0-9]", "", memory.id)[-8:]
+    short_id = re.sub(r"[^a-zA-Z0-9]", "", memory.id)[-8:] or "memory"
     return f"{date}-galaxymem-{short_id}.md"
 
 
 def format_proposal_note(memory: MemoryRecord, store: Store) -> str:
-    """Render a proposal note matching the vault's frontmatter conventions
-    (workflow:draft tag, topic tags, provenance back to memory ids)."""
+    """Render a proposal note matching the vault's frontmatter conventions."""
+    from .sanitize import yaml_quote, prompt_escape
+
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     lines = [
         "---",
-        f'title: "{_proposal_title(memory)}"',
+        f"title: {yaml_quote(_proposal_title(memory))}",
         f"created: {created}",
         "type: memory-promotion",
         "tags:",
@@ -115,31 +116,34 @@ def format_proposal_note(memory: MemoryRecord, store: Store) -> str:
         "  - source:galaxymem",
     ]
     for eid in memory.entity_ids:
-        lines.append(f"  - topic:{eid}")
+        safe_eid = re.sub(r"[^a-zA-Z0-9._-]", "-", str(eid))[:64]
+        if safe_eid:
+            lines.append(f"  - topic:{safe_eid}")
     lines += [
         "provenance:",
         "  memory_ids:",
-        f"    - {memory.id}",
+        f"    - {yaml_quote(memory.id)}",
     ]
     for sid in memory.source_memory_ids:
-        lines.append(f"    - {sid}")
+        lines.append(f"    - {yaml_quote(sid)}")
     lines += [
         f"  network: {memory.network.value}",
         f"  recall_count: {memory.recall_count}",
         f"  reflect_cycles: {memory.reflect_cycles}",
-        f"  first_seen: {memory.created_at.isoformat()}",
+        f"  first_seen: {yaml_quote(memory.created_at.isoformat())}",
         "---",
         "",
-        memory.text,
+        memory.text.replace("\x00", ""),
         "",
     ]
 
-    # Include supporting sources (opinions carry their derivation)
     if memory.source_memory_ids:
         lines.append("## Supporting memories")
+        sources = store.get_memories_by_ids(list(memory.source_memory_ids))
         for sid in memory.source_memory_ids:
-            src = store.get_memory(sid)
-            lines.append(f"- `{sid}` — {src.text if src else '(not found)'}")
+            src = sources.get(sid)
+            snippet = prompt_escape(src.text, max_len=200) if src else "(not found)"
+            lines.append(f"- `{sid}` — {snippet}")
         lines.append("")
 
     return "\n".join(lines)
@@ -147,19 +151,18 @@ def format_proposal_note(memory: MemoryRecord, store: Store) -> str:
 
 def write_proposal(store: Store, memory: MemoryRecord,
                    notes_path: Optional[Path] = None) -> Optional[Path]:
-    """Write exactly one proposal note for a memory into the vault inbox.
+    """Write exactly one proposal note for a memory into the vault inbox."""
+    from .sanitize import resolve_under
 
-    Records the proposal in the promotion_queue ledger so re-running never
-    duplicates it (Phase 8 checkpoint).
-    """
     inbox = notes_path or cfg.VAULT_NOTES_PATH
     if inbox is None:
-        return None  # No vault configured, skip promotion
+        return None
     try:
+        inbox = Path(inbox).expanduser().resolve()
         inbox.mkdir(parents=True, exist_ok=True)
-        note_path = inbox / _proposal_filename(memory)
+        note_path = resolve_under(_proposal_filename(memory), inbox)
         note_path.write_text(format_proposal_note(memory, store), encoding="utf-8")
-    except OSError as e:
+    except (OSError, ValueError) as e:
         logger.error("Failed to write proposal note for %s: %s", memory.id, e)
         return None
 
@@ -207,17 +210,32 @@ def check_approved_promotions(store: Store,
 def _find_promoted_note(root: Path, memory_id: str,
                         note_hint: Optional[str]) -> Optional[Path]:
     """Find a note referencing memory_id whose frontmatter says workflow:promoted."""
+    from .sanitize import is_under
+
+    root = Path(root).expanduser().resolve()
     candidates: list[Path] = []
     if note_hint:
-        hint = Path(note_hint)
-        if hint.exists():
+        hint = Path(note_hint).expanduser()
+        try:
+            hint = hint.resolve()
+        except OSError:
+            hint = None
+        if hint is not None and hint.exists() and is_under(hint, root):
             candidates.append(hint)
     if not candidates:
         try:
-            candidates = [
-                p for p in root.rglob("*.md")
-                if memory_id in p.read_text(encoding="utf-8", errors="ignore")
-            ]
+            scanned = 0
+            for p in root.rglob("*.md"):
+                scanned += 1
+                if scanned > 500:
+                    break
+                if not is_under(p, root):
+                    continue
+                try:
+                    if memory_id in p.read_text(encoding="utf-8", errors="ignore"):
+                        candidates.append(p)
+                except OSError:
+                    continue
         except OSError:
             return None
 

@@ -17,6 +17,7 @@ import logging
 from typing import Optional
 
 from .models import MemoryRecord, MemoryStatus
+from .store import Store
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,9 @@ def extract_procedural(store, flagged_turn: str) -> Optional[dict]:
         # This is a how-to / constraint — promote to procedural
         return {
             "text": text,
-            "network": "procedure",
-            "entity_ids": [],  # filled by the caller's entity resolution
+            "network": "observation",
+            "procedural": True,
+            "entity_ids": [],
             "flag_reason": reason,
         }
     return None
@@ -67,27 +69,30 @@ def detect_gaps(
         return []
 
     gaps = []
-    # For each returned memory, find edges pointing to neighbors that are
-    # NOT in the results — the "forgotten neighbor" effect.
+    recalled_ids = {r.id for r in results}
+    neighbor_of: dict[str, MemoryRecord] = {}
+    try:
+        neighbor_map = store.neighbors_for_ids([m.id for m in results], min_weight=0.3)
+    except Exception:
+        neighbor_map = {}
     for mem in results:
-        try:
-            neighbors = store.neighbors(mem.id, min_weight=0.3)
-            for nid, edge in neighbors:
-                if nid not in [r.id for r in results]:  # not already recalled
-                    sibling = store.get_memory(nid)
-                    if sibling is None or sibling.status != MemoryStatus.active:
-                        continue
-                    # Only surface if the sibling was created more recently
-                    # than the recalled memory — it's "newer and you already
-                    # know it's related".
-                    if sibling.created_at and sibling.created_at > mem.created_at:
-                        gaps.append(
-                            f"- You also remember: '{sibling.text[:80]}' "
-                            f"(linked to '{mem.text[:40]}')"
-                        )
-                        if len(gaps) >= 3:
-                            return gaps
-        except Exception:
-            continue
+        for nid, _edge in neighbor_map.get(mem.id, []):
+            if nid in recalled_ids:
+                continue
+            neighbor_of.setdefault(nid, mem)
 
+    fetched = store.get_memories_by_ids(list(neighbor_of)) if neighbor_of else {}
+    for nid, sibling in fetched.items():
+        if sibling.status != MemoryStatus.active:
+            continue
+        mem = neighbor_of.get(nid)
+        if mem is None:
+            continue
+        if sibling.created_at and sibling.created_at > mem.created_at:
+            gaps.append(
+                f"- You also remember: '{sibling.text[:80]}' "
+                f"(linked to '{mem.text[:40]}')"
+            )
+            if len(gaps) >= 3:
+                return gaps
     return gaps

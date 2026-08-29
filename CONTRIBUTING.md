@@ -7,7 +7,7 @@ Contributions welcome. This guide covers the basics.
 ```bash
 git clone https://github.com/k1ng0mar/galaxymem.git
 cd galaxymem
-pip install -e ".[dev,viewer]"
+pip install -e ".[dev]"
 ```
 
 ## Running tests
@@ -16,7 +16,7 @@ pip install -e ".[dev,viewer]"
 pytest galaxymem/tests/ -v
 ```
 
-The full suite must pass (currently ~229 tests; the exact count grows as tests
+The full suite must pass (currently ~294 tests; the exact count grows as tests
 are added). The test suite mirrors the module structure — see `galaxymem/tests/`
 for coverage breakdown.
 

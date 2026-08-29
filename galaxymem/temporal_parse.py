@@ -86,11 +86,8 @@ def parse_temporal_range(
 
     if _LAST_MONTH.search(query):
         first_of_this = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-        if now.month == 12:
-            pass
-        end = first_of_this
         prev_year, prev_month = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
-        return datetime(prev_year, prev_month, 1, tzinfo=timezone.utc), end
+        return datetime(prev_year, prev_month, 1, tzinfo=timezone.utc), first_of_this
 
     if _LAST_WEEK.search(query):
         return now - timedelta(days=7), now

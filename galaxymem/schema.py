@@ -100,7 +100,7 @@ class SessionSummariesTable(LanceModel):
     last_updated: str  # ISO datetime
 
 
-# ── SQL litera escaping ────────────────────────────────────────────────────
+# ── SQL literal escaping ────────────────────────────────────────────────────
 
 _LIKE_SPECIALS = {"%": "\\%", "_": "\\_", "[": "\\[", "]": "\\]"}
 
@@ -117,6 +117,8 @@ def _esc(val: str, *, escape_like: bool = False) -> str:
 
     When escape_like=True, also escapes LIKE wildcards (%) and (_).
     """
+    if val is None:
+        return ""
     s = str(val)
     s = s.replace("\\", "\\\\")
     s = s.replace('"', '\\"')
@@ -128,3 +130,15 @@ def _esc(val: str, *, escape_like: bool = False) -> str:
         for old, new in _LIKE_SPECIALS.items():
             s = s.replace(old, new)
     return s
+
+
+def _in_list(values: list[str]) -> str:
+    """Build a quoted, escaped IN (...) list from string values.
+
+    Empty input becomes an unsatisfiable singleton so callers never emit
+    the illegal SQL fragment ``IN ()``.
+    """
+    quoted = ",".join(f'"{_esc(v)}"' for v in values if v is not None)
+    if not quoted:
+        return '("__galaxymem_empty__")'
+    return f"({quoted})"

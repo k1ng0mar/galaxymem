@@ -1048,6 +1048,11 @@ class GalaxyMemProvider(MemoryProvider):
         text = (args.get("text") or "").strip()
         if not text:
             return tool_error("Missing required parameter: text")
+        from .redact import redact_secrets
+        from . import config as cfg
+        text = redact_secrets(text)[:cfg.MAX_MEMORY_TEXT_CHARS]
+        if not text.strip():
+            return tool_error("Memory text was empty after secret redaction")
 
         network_str = args.get("network", "world")
         try:
@@ -1088,14 +1093,16 @@ class GalaxyMemProvider(MemoryProvider):
         pipeline against the historical store (temporal mode, no touching).
         """
         from datetime import datetime as _dt, timezone
-        from .recall import recall as do_recall
+        from .confidence import compute_confidence, classify_confidence
         from .queryexpansion import expand_query, should_expand
+        from .recall import recall as do_recall
+        from .sanitize import clamp_int
 
         query = (args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required parameter: query")
 
-        limit = min(int(args.get("limit", 8)), 50)
+        limit = clamp_int(args.get("limit", 8), 8, lo=1, hi=50)
 
         raw_entities = [e for e in (args.get("entities") or []) if (e or "").strip()]
         entity_ids = self._resolve_entity_args(raw_entities)
@@ -1142,14 +1149,8 @@ class GalaxyMemProvider(MemoryProvider):
             return json.dumps({"results": [], "count": 0, "query": query})
 
         now = _dt.now(timezone.utc)
-        # Confidence scoring: augment each memory with its confidence metadata.
-        # The blend (sources × edges × reflections × status) replaces the
-        # simplistic "recall_count × brightness" ranking for trust-aware
-        # retrieval — a memory with 5 sources and 3 reflections outranks one
-        # with 1 source from yesterday even if it's buried deeper in time.
         items = []
         for mem in results:
-            from .confidence import compute_confidence
             conf = compute_confidence(mem, self._store)
             items.append({
                 "id": mem.id,
@@ -1455,12 +1456,13 @@ class GalaxyMemProvider(MemoryProvider):
     def _handle_reason(self, args: dict) -> str:
         """gm_reason: evidence-backed reasoning over memories (synchronous)."""
         from .reason import reason as do_reason
+        from .sanitize import clamp_int
 
         query = (args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required parameter: query")
 
-        max_sources = min(int(args.get("max_sources", 8)), 20)
+        max_sources = clamp_int(args.get("max_sources", 8), 8, lo=1, hi=20)
 
         raw_entities = [e for e in (args.get("entities") or []) if (e or "").strip()]
         entity_ids = self._resolve_entity_args(raw_entities)
@@ -1514,12 +1516,13 @@ class GalaxyMemProvider(MemoryProvider):
     def _handle_session_search(self, args: dict) -> str:
         """gm_session_search: search past sessions by keyword."""
         from .summaries import search_sessions_by_text
+        from .sanitize import clamp_int
 
         query = (args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required parameter: query")
 
-        limit = min(int(args.get("limit", 5)), 20)
+        limit = clamp_int(args.get("limit", 5), 5, lo=1, hi=20)
         matches = search_sessions_by_text(self._store, query, limit=limit)
 
         results = []
@@ -1544,7 +1547,14 @@ class GalaxyMemProvider(MemoryProvider):
         if not output_path_raw:
             return tool_error("Missing required parameter: output_path")
 
-        output_path = Path(output_path_raw)
+        from .sanitize import resolve_under
+        sandbox_root = Path(self._db_path).expanduser().resolve().parent
+        try:
+            output_path = resolve_under(output_path_raw, sandbox_root)
+        except ValueError as e:
+            return tool_error(
+                f"Export path must stay under {sandbox_root}: {e}"
+            )
         try:
             export_data = {}
             # Memories
@@ -1558,18 +1568,9 @@ class GalaxyMemProvider(MemoryProvider):
                 for e in self._store.list_entities()
             ]
             # Edges
-            edges = []
-            for mem in self._store.list_memories():
-                edges.extend(self._store.get_edges_for_memory(mem.id))
-            # Deduplicate edges (from_id, to_id, kind)
-            seen_edges = set()
-            unique_edges = []
-            for e in edges:
-                key = (e.from_id, e.to_id, e.kind.value)
-                if key not in seen_edges:
-                    seen_edges.add(key)
-                    unique_edges.append(e.model_dump(mode="json"))
-            export_data["edges"] = unique_edges
+            export_data["edges"] = [
+                e.model_dump(mode="json") for e in self._store.list_edges()
+            ]
             # Identity links
             export_data["identity_links"] = [
                 link.model_dump(mode="json")

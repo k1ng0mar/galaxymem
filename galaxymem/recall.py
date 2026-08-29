@@ -73,28 +73,19 @@ def get_hot_cache(store: Store, entity_ids: Optional[list[str]] = None) -> list[
     # load only id/recall_count/last_recalled_at/created_at/text/entity_ids first,
     # sort by relevance, then take top N. This avoids loading 50k+ records
     # into pandas on every hot_cache injection.
-    MAX_CANDIDATES = max(cfg.HOT_CACHE_K * 10, 200)  # generous upper bound
+    MAX_CANDIDATES = max(cfg.HOT_CACHE_K * 10, 200)
 
     try:
-        df = store._memories.search().where(
-            'status = "active"'
-        ).limit(MAX_CANDIDATES).to_pandas()
+        memories_raw = store.list_active_candidates(limit=MAX_CANDIDATES)
     except Exception:
-        # Fallback for stores that don't support limit
-        df = store._memories.search().where('status = "active"').to_pandas()
-        df = df.sort_values("recall_count", ascending=False).head(MAX_CANDIDATES)
+        memories_raw = store.list_memories(status=MemoryStatus.active, limit=MAX_CANDIDATES)
 
-    if df.empty:
+    if not memories_raw:
         return []
-
-    from .store import _from_memory
 
     memories = []
     scores = []
-    for _, row in df.iterrows():
-        mem = _from_memory(row.to_dict())
-        # Filter by entity_ids if provided. Unscoped memories (general
-        # knowledge) ride along, mirroring the D8 recall scope.
+    for mem in memories_raw:
         if entity_ids and mem.entity_ids and \
                 not any(eid in mem.entity_ids for eid in entity_ids):
             continue
@@ -238,14 +229,15 @@ def spreading_activation(
     frontier = {sid: 1.0 for sid in seed_memory_ids}
 
     for _hop in range(max_hops):
+        if not frontier:
+            break
         next_frontier: dict[str, float] = {}
+        try:
+            neighbor_map = store.neighbors_for_ids(list(frontier), min_weight=min_weight)
+        except Exception:
+            neighbor_map = {}
         for mem_id, current_activation in frontier.items():
-            try:
-                neighbors = store.neighbors(mem_id, min_weight=min_weight)
-            except Exception:
-                continue
-
-            for neighbor_id, edge in neighbors:
+            for neighbor_id, edge in neighbor_map.get(mem_id, []):
                 # Activation = parent_activation * edge_weight * decay
                 new_activation = current_activation * edge.weight * decay
                 if new_activation < min_weight * decay:
@@ -260,8 +252,6 @@ def spreading_activation(
                     next_frontier[neighbor_id] = new_activation
 
         frontier = next_frontier
-        if not frontier:
-            break
 
     return activation
 
@@ -413,22 +403,29 @@ def deep_recall(
         # Edges are not versioned, so temporal queries skip this leg.
         if use_spreading and not temporal:
             top_seed_ids = sorted(final_scores, key=final_scores.get, reverse=True)[:5]
+            neighbor_hits: list[tuple[str, str, Any]] = []  # seed, neighbor, edge
+            try:
+                neighbor_map = store.neighbors_for_ids(
+                    top_seed_ids, min_weight=cfg.ACTIVATION_MIN_WEIGHT,
+                )
+            except Exception:
+                neighbor_map = {}
             for seed_id in top_seed_ids:
-                parent_score = final_scores[seed_id]
-                try:
-                    neighbors = store.neighbors(seed_id, min_weight=cfg.ACTIVATION_MIN_WEIGHT)
-                except Exception:
-                    continue
-                for neighbor_id, edge in neighbors:
+                for neighbor_id, edge in neighbor_map.get(seed_id, []):
                     if neighbor_id in final_scores:
-                        continue  # already a search hit; don't double-count
-                    mem = store.get_memory(neighbor_id)
-                    if mem is None or mem.status != MemoryStatus.active:
                         continue
-                    candidates[neighbor_id] = mem
-                    final_scores[neighbor_id] = (
-                        parent_score * edge.weight * cfg.ACTIVATION_DAMPING
-                    )
+                    neighbor_hits.append((seed_id, neighbor_id, edge))
+            missing_ids = [nid for _, nid, _ in neighbor_hits if nid not in candidates]
+            fetched = store.get_memories_by_ids(missing_ids) if missing_ids else {}
+            for seed_id, neighbor_id, edge in neighbor_hits:
+                mem = candidates.get(neighbor_id) or fetched.get(neighbor_id)
+                if mem is None or mem.status != MemoryStatus.active:
+                    continue
+                candidates[neighbor_id] = mem
+                parent_score = final_scores[seed_id]
+                final_scores[neighbor_id] = (
+                    parent_score * edge.weight * cfg.ACTIVATION_DAMPING
+                )
 
         ranked_ids = sorted(final_scores, key=final_scores.get, reverse=True)
 
@@ -452,19 +449,14 @@ def deep_recall(
 
         # Step 5: reinforcement — skip entirely in temporal mode
         if not temporal:
-            for mem_id in top_ids:
-                try:
-                    store.touch_memory(mem_id)
-                except Exception as e:
-                    logger.warning("Failed to touch memory %s: %s", mem_id, e)
+            try:
+                store.touch_memories(top_ids)
+            except Exception as e:
+                logger.warning("Failed to touch recalled memories: %s", e)
             _nudge_corecalled_edges(store, top_ids)
-            # Usefulness feedback: candidates that were retrieved but NOT in the
-            # final top-k are "misses" — they cost retrieval but weren't used.
-            # Returned ones are "hits". Feeds the promote/demote usefulness policy.
             try:
                 miss_ids = [mid for mid in candidates if mid not in set(top_ids)]
-                for mid in miss_ids:
-                    store.bump_recall_miss(mid)
+                store.bump_recall_misses(miss_ids)
             except Exception as e:
                 logger.debug("Usefulness miss tracking skipped: %s", e)
 
@@ -491,25 +483,26 @@ def _nudge_corecalled_edges(store: Store, memory_ids: list[str],
         return
     id_set = set(memory_ids)
     seen: set[tuple[str, str, str]] = set()
+    try:
+        neighbor_map = store.neighbors_for_ids(memory_ids, min_weight=0.0)
+    except Exception:
+        neighbor_map = {}
     for mem_id in memory_ids:
-        try:
-            edges = store.get_edges_for_memory(mem_id)
-        except Exception:
-            continue
-        for edge in edges:
-            if edge.from_id in id_set and edge.to_id in id_set:
-                key = (edge.from_id, edge.to_id, edge.kind.value)
-                if key in seen:
-                    continue
-                seen.add(key)
-                try:
-                    store.update_edge_weight(
-                        edge.from_id, edge.to_id, edge.kind.value,
-                        min(1.0, edge.weight + step),
-                    )
-                except Exception as e:
-                    logger.debug("Edge nudge failed for %s→%s: %s",
-                                 edge.from_id, edge.to_id, e)
+        for neighbor_id, edge in neighbor_map.get(mem_id, []):
+            if neighbor_id not in id_set:
+                continue
+            key = (edge.from_id, edge.to_id, edge.kind.value)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                store.update_edge_weight(
+                    edge.from_id, edge.to_id, edge.kind.value,
+                    min(1.0, edge.weight + step),
+                )
+            except Exception as e:
+                logger.debug("Edge nudge failed for %s→%s: %s",
+                             edge.from_id, edge.to_id, e)
 
 
 # ── Entry points ───────────────────────────────────────────────────────

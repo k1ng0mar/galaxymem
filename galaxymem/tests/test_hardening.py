@@ -128,7 +128,7 @@ class TestEscHardening:
     def test_esc_non_string_types(self):
         bs = chr(92)
         assert _esc(42) == '42'
-        assert _esc(None) == 'None'
+        assert _esc(None) == ''
         assert _esc(True) == 'True'
         # The _esc function escapes single quotes too, so non-string types
         # get their repr escaped (quirk — documents existing behaviour).

@@ -296,8 +296,8 @@ def flag_turn(
 
     from .redact import find_secrets, redact_secrets
 
-    if find_secrets(turn_text):
-        spans = find_secrets(turn_text)
+    spans = find_secrets(turn_text)
+    if spans:
         with _REDACTION_LOCK:
             _REDACTION_COUNTER["spans"] += len(spans)
             _REDACTION_COUNTER["turns"] += 1
@@ -448,23 +448,16 @@ def _normalize_canonical_key(key: str) -> str:
 def _sanitize_turn_text(turn_text: str) -> str:
     """Strip control sequences and redact credential-shaped strings from
     flagged turn text before embedding into the LLM extraction prompt.
-
-    Removes attempts at prompt injection by:
-    1. Redacting secret-shaped strings (keys, tokens, password assignments)
-       so credentials never reach the LLM prompt OR the flags table
-    2. Truncating excessively long turns
-    3. JSON-escaping control characters that could break parsing
     """
-    # Truncate very long turn text to cap prompt size
     text = turn_text[:4096]
     from .redact import find_secrets, redact_secrets
+    from .sanitize import prompt_escape
 
-    if find_secrets(text):
-        logger.info("Redacted %d credential-shaped span(s) in flagged turn", len(find_secrets(text)))
+    hits = find_secrets(text)
+    if hits:
+        logger.info("Redacted %d credential-shaped span(s) in flagged turn", len(hits))
         text = redact_secrets(text)
-    # JSON-escape the raw text, then strip the outer quotes — this escapes
-    # quotes, backslashes, and control characters that could break parsing.
-    return json.dumps(text)[1:-1]
+    return prompt_escape(text, max_len=4096)
 
 
 def _build_extraction_prompt(flags: list[FlagRecord]) -> str:
@@ -481,32 +474,8 @@ def _build_extraction_prompt(flags: list[FlagRecord]) -> str:
 
 def _parse_llm_response(response: str) -> list[dict]:
     """Parse the LLM JSON response, handling markdown code fences."""
-    text = response.strip()
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first and last lines (fences)
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-
-    try:
-        result = json.loads(text)
-        if isinstance(result, list):
-            return result
-        elif isinstance(result, dict):
-            return [result]
-        return []
-    except json.JSONDecodeError:
-        # Try to find JSON array in the response
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                pass
-        logger.warning("Failed to parse LLM response as JSON: %.200s...", text)
-        return []
+    from .sanitize import parse_json_array
+    return [item for item in parse_json_array(response) if isinstance(item, dict)]
 
 
 # ── Pass 2 entry point ──────────────────────────────────────────────────
@@ -663,17 +632,14 @@ def _process_batch(
     # Validate extracted memories against injection attempts
     def _is_suspicious_memory(mem_text: str) -> bool:
         """Reject memories that contain prompt-injection markers."""
-        lower = mem_text.lower()
-        injection_markers = [
-            "ignore previous", "forget everything", "you are now",
-            "system prompt", "new rule", "override", "bypass",
-            "extract this", "return json", "[credential", "api key",
-            "sk-", "password:", "secret:", "token:",
-        ]
-        for marker in injection_markers:
-            if marker in lower:
-                logger.warning("Rejected suspicious memory text: %.60s...", mem_text)
-                return True
+        from .sanitize import looks_like_injection
+        from .redact import find_secrets
+        if looks_like_injection(mem_text):
+            logger.warning("Rejected suspicious memory text: %.60s...", mem_text)
+            return True
+        if find_secrets(mem_text):
+            logger.warning("Rejected memory that still contains credential-shaped text")
+            return True
         return False
 
     for item in extracted:
@@ -681,6 +647,8 @@ def _process_batch(
             mem_text = item.get("text", "").strip()
             if not mem_text:
                 continue
+            from .redact import redact_secrets
+            mem_text = redact_secrets(mem_text)[:cfg.MAX_MEMORY_TEXT_CHARS]
             if _is_suspicious_memory(mem_text):
                 continue
 

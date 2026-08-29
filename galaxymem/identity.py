@@ -13,8 +13,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from .store import _esc
-
 from .entities import (
     get_identity_links,
     link_identity_explicit,
@@ -209,17 +207,14 @@ def get_platform_map(store: Store) -> dict[str, dict[str, str]]:
 
     Only includes non-merged entities (skips entities with merged_into set).
     """
-    # Scan the identities table directly — it's the source of truth for links.
-    df = store._identities.search().to_pandas()
+    # Scan identity links via the public Store API (never the private table).
     result: dict[str, dict[str, str]] = {p: {} for p in SUPPORTED_PLATFORMS}
 
-    for _, row in df.iterrows():
-        platform = row["platform"]
-        external_id = row["external_id"]
-        entity_id = row["entity_id"]
+    for link in store.list_identity_links():
+        platform = link.platform
         if platform not in result:
             result[platform] = {}
-        result[platform][external_id] = entity_id
+        result[platform][link.external_id] = link.entity_id
 
     return result
 
@@ -329,12 +324,9 @@ def format_identity_card(store: Store, entity_id: str) -> str:
 
     # Count memories referencing this entity
     try:
-        mem_df = store._memories.search().where(
-            f'entity_ids LIKE "%{_esc(entity_id)}%"'
-        ).to_pandas()
-        memory_count = len(mem_df)
+        memory_count = store.count_memories_for_entity(entity_id)
     except Exception:
-        memory_count = -1  # signal that count failed
+        memory_count = -1
 
     # Build platform lines
     if links:

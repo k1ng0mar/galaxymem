@@ -41,10 +41,11 @@ GalaxyMem is deliberately split into **storage**, **records**, **logic**, and
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `config.py` | All tunables, env-overridable | nothing |
+| `config.py` | All tunables, env-overridable | `sanitize` (env parsers) |
+| `sanitize.py` | Prompt/YAML/JSON/path sandbox helpers | nothing |
 | `models.py` | Pydantic record types (Memory, Entity, Edge, Identity) | `config` |
 | `schema.py` | LanceDB `LanceModel` table definitions + `_esc` | `config` |
-| `store.py` | The `Store` class: CRUD, vector/keyword search, edges, hot cache, flags, stats, versioning | `schema`, `models`, `config` |
+| `store.py` | The `Store` class: CRUD, vector/keyword search, edges, hot cache, flags, stats, versioning | `schema`, `models`, `config`, `redact` |
 | `entities.py` | Entity CRUD, provisional provisioning, slug resolution | `store`, `models` |
 | `identity.py` | Platform↔entity link resolution | `store`, `models` |
 | `retain.py` | Pass 1 flag rules + Pass 2 LLM extraction | `store`, `entities`, `models`, `config` |
@@ -52,7 +53,6 @@ GalaxyMem is deliberately split into **storage**, **records**, **logic**, and
 | `reflect.py` | Supersession, contradiction, opinion formation, cascades | `store`, `models`, `config` |
 | `promote.py` | Export high-value memories to vault/wiki (human-gated) | `store`, `models`, `config` |
 | `provider.py` | Hermes `MemoryProvider` impl: tool schemas, `initialize()`, prefetch | everything above |
-| `viewer/` | Optional FastAPI + JS frontend for browsing the graph | `store` (read-only) |
 
 **Key rule:** `store.py` contains *zero* business logic — it moves rows in and
 out of LanceDB and runs searches. All "what should we remember / what does this
