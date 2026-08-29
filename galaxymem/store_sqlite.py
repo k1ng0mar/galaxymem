@@ -762,12 +762,26 @@ class Store:
             (platform, external_id),
         ).connection.commit()
 
-    def resolve_identity(self, platform: str, external_id: str) -> Optional[str]:
+    def resolve_identity(self, platform: str, external_id: str) -> Optional[IdentityLink]:
+        """Return the IdentityLink for a (platform, external_id), or None.
+
+        Matches the LanceDB store's contract (returns an IdentityLink
+        object, not the bare entity_id string), so provider/entities call
+        sites are backend-agnostic.
+        """
         rows = self._query(
-            "SELECT entity_id FROM identity_links WHERE platform = ? AND external_id = ?",
+            "SELECT * FROM identity_links WHERE platform = ? AND external_id = ?",
             (platform, external_id),
         )
-        return rows[0]["entity_id"] if rows else None
+        if not rows:
+            return None
+        r = rows[0]
+        return IdentityLink(
+            platform=r["platform"], external_id=r["external_id"],
+            entity_id=r["entity_id"],
+            created_at=datetime.fromisoformat(r["created_at"]) if r["created_at"] else datetime.now(timezone.utc),
+            created_by=LinkMethod(r["created_by"]),
+        )
 
     def get_identity_links_for_entity(self, entity_id: str) -> list[IdentityLink]:
         rows = self._query(
@@ -1038,8 +1052,13 @@ class Store:
              summary.last_updated.isoformat() if summary.last_updated else datetime.now(timezone.utc).isoformat()),
         ).connection.commit()
 
-    def list_session_summaries(self) -> list[SessionSummary]:
-        rows = self._query("SELECT * FROM session_summaries ORDER BY last_updated DESC")
+    def list_session_summaries(self, limit: Optional[int] = None) -> list[SessionSummary]:
+        sql = "SELECT * FROM session_summaries ORDER BY last_updated DESC"
+        params: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        rows = self._query(sql, params)
         out = []
         for r in rows:
             out.append(SessionSummary(
