@@ -9,7 +9,8 @@ be read in full before any installation steps.
 ## What this project is
 
 GalaxyMem is an entity-scoped memory engine for AI agents. It stores memories
-in LanceDB (a local vector database), classifies them into four epistemic
+in a single SQLite database file (with sqlite-vec for vector search and FTS5
+for keyword search), classifies them into four epistemic
 networks (world / experience / opinion / observation), decays them over time,
 and runs autonomous reflection cycles to resolve contradictions and form
 opinions.
@@ -29,9 +30,9 @@ python3 --version   # needs >= 3.10
 pip --version       # needs pip
 ```
 
-GalaxyMem's heavy dependencies are `lancedb` (Lance vector DB) and `fastembed`
-(local ONNX embeddings). These pull in `pyarrow`, `onnxruntime`, `numpy`,
-`pandas`. The first install downloads a ~100MB embedding model
+GalaxyMem's heavy dependencies are `sqlite-vec` (SQLite vector extension) and
+`fastembed` (local ONNX embeddings). These pull in `onnxruntime` and `numpy`.
+The first install downloads a ~100MB embedding model
 (`BAAI/bge-small-en-v1.5`) on first use.
 
 **Disk:** ~500MB for dependencies + model.  
@@ -63,21 +64,21 @@ hermes tools list | grep gm_
 
 If the `gm_*` tools don't appear, check:
 - `pip show galaxymem` returns the package
-- `python -c "from galaxymem.store import Store"` works
-- Hermes logs show "GalaxyMem store opened"
+- `python -c "from galaxymem.store_sqlite import Store"` works
+- Hermes logs show "GalaxyMem store opened (backend=sqlite)"
 
 ### Mode 2: Standalone (no Hermes)
 
 ```bash
 git clone https://github.com/k1ng0mar/galaxymem.git
 cd galaxymem
-pip install -e ".[dev]"
+pip install -e .
 ```
 
 Verify:
 ```bash
-python -c "from galaxymem.store import Store; print('OK')"
-python -m pytest galaxymem/tests/ -q   # should show the full suite passing (currently ~294 tests; exact count grows as tests are added)
+python -c "from galaxymem.store_sqlite import Store; print('OK')"
+python -c "import galaxymem; print(galaxymem.__version__)"
 ```
 
 ---
@@ -93,7 +94,8 @@ galaxymem/                 # repo root (also the Hermes plugin dir)
 ├── conftest.py            # pytest boundary (do not delete)
 ├── galaxymem/             # the actual Python package
 │   ├── __init__.py        # public API re-exports
-│   ├── store.py           # Store class
+│   ├── store_sqlite.py    # Store class (SQLite + FTS5 + sqlite-vec)
+│   ├── embed.py           # embeddings (fastembed + fallback)
 │   ├── ...
 │   └── tests/
 └── pyproject.toml
@@ -131,20 +133,14 @@ provider class.
 
 ### `ModuleNotFoundError: No module named 'fastapi'`
 
-The viewer needs the `[viewer]` extra:
-```bash
-pip install -e ".[dev]"
-```
+The optional viewer isn't part of the core package. Install fastapi +
+uvicorn separately only if you're running the viewer.
 
-### Tests fail with `ImportError while loading conftest`
+### SQLite lock errors
 
-The root `conftest.py` is missing or was deleted. Recreate it (any content —
-even empty — works, it just needs to exist at the repo root).
-
-### LanceDB lock errors
-
-If a previous process crashed mid-write, LanceDB may leave a stale lock file.
-Delete `~/.galaxymem/db/*.lock` and retry. Data is not lost.
+SQLite recovers from crashed writes automatically via its WAL journal on
+next open. If `.db-wal`/`.db-shm` files linger after every process has
+exited, delete them — the main `.sqlite3` file is always consistent.
 
 ---
 
@@ -154,7 +150,7 @@ All settings are environment variables prefixed `GALAXYMEM_`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GALAXYMEM_DB_PATH` | `~/.galaxymem/db` | Where LanceDB stores data |
+| `GALAXYMEM_DB_PATH` | `~/.galaxymem/db` | Where SQLite stores data |
 | `GALAXYMEM_DECAY_HALF_LIFE_DAYS` | `30` | Memory fade rate |
 | `GALAXYMEM_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `GALAXYMEM_HOT_CACHE_K` | `8` | Max memories in hot cache |
@@ -168,14 +164,13 @@ For Hermes Agent, config can also go in `$HERMES_HOME/galaxymem.json`.
 ## When modifying the codebase
 
 1. **Read ARCHITECTURE.md first.** It explains the module boundaries and why
-   `store.py` has zero business logic.
+   the store has zero business logic.
 2. **The store layer is Hermes-agnostic.** Only `provider.py` imports Hermes
    internals. Keep it that way.
-3. **Tests must pass:** `pytest galaxymem/tests/ -v` (full suite; currently ~294 tests, exact count grows as tests are added).
-4. **No new dependencies without justification.** The current deps are
-   lancedb, fastembed, pydantic, numpy, requests. The viewer adds fastapi +
-   uvicorn. Dev adds pytest.
-5. **Python 3.10+ required.** The codebase uses `from __future__ import
+3. **No new dependencies without justification.** The current deps are
+   sqlite-vec, fastembed, pydantic, numpy, pandas, requests. The viewer adds
+   fastapi + uvicorn.
+4. **Python 3.10+ required.** The codebase uses `from __future__ import
    annotations` and union type syntax.
 
 ---
@@ -185,11 +180,9 @@ For Hermes Agent, config can also go in `$HERMES_HOME/galaxymem.json`.
 When an AI agent is setting up GalaxyMem for a user, verify each item:
 
 - [ ] `python3 --version` shows 3.10+
-- [ ] `pip install -e ".[dev]"` completed without errors
-- [ ] `python -c "from galaxymem.store import Store"` succeeds
-- [ ] `python -c "import galaxymem; print(galaxymem.__version__)"` prints `0.1.1`
+- [ ] `pip install -e .` completed without errors
+- [ ] `python -c "from galaxymem.store_sqlite import Store"` succeeds
+- [ ] `python -c "import galaxymem; print(galaxymem.__version__)"` prints `0.2.0`
 - [ ] If Hermes: `GalaxyMemProvider` is not `None` when imported inside Hermes
 - [ ] If standalone: `GalaxyMemProvider` is `None` (expected, not an error)
-- [ ] `pytest galaxymem/tests/ -q` shows the full suite passing (currently ~294 tests; exact count grows as tests are added)
-- [ ] The viewer starts: `python -c "from galaxymem.viewer.app import run_viewer; run_viewer()"`
 - [ ] The DB path is writable and has disk space (~500MB headroom)

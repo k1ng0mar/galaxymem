@@ -1,0 +1,1106 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The LanceDB Authors
+
+from datetime import timedelta
+import deprecation
+import logging
+from functools import cached_property
+import os
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Union,
+    Literal,
+    overload,
+)
+import warnings
+
+from lancedb import __version__
+from lancedb._blob import BlobFile
+
+from lancedb._lancedb import (
+    AddColumnsResult,
+    AddResult,
+    AlterColumnsResult,
+    UpdateFieldMetadataResult,
+    DeleteResult,
+    DropColumnsResult,
+    FtsToken,
+    IndexConfig,
+    LsmWriteSpec,
+    MergeResult,
+    UpdateResult,
+)
+from lancedb.embeddings.base import EmbeddingFunctionConfig
+from lancedb.index import (
+    FTS,
+    BTree,
+    Bitmap,
+    HnswFlat,
+    HnswSq,
+    IvfFlat,
+    IvfPq,
+    IvfRq,
+    IvfSq,
+    LabelList,
+)
+from lancedb.job import Job
+from lancedb.remote.db import LOOP
+from lancedb.table import IndexConfigType, KNOWN_METRICS
+import pyarrow as pa
+
+from lancedb.common import DATA, VEC, VECTOR_COLUMN_NAME
+from lancedb.merge import LanceMergeInsertBuilder
+from lancedb.embeddings import EmbeddingFunctionRegistry
+from lancedb.table import _normalize_progress
+
+from ..query import (
+    AnalyzePlanDistributedMetrics,
+    LanceQueryBuilder,
+    LanceTakeQueryBuilder,
+    LanceVectorQueryBuilder,
+)
+from ..table import AsyncTable, BlobMode, Branches, IndexStatistics, Query, Table, Tags
+from ..types import BaseTokenizerType
+
+
+class RemoteTable(Table):
+    def __init__(
+        self,
+        table: AsyncTable,
+        db_name: str,
+        *,
+        connection_state: Optional[Union[str, Callable[[], str]]] = None,
+        namespace_path: Optional[List[str]] = None,
+    ):
+        self._table_handle = table
+        self._name = table.name
+        self.db_name = db_name
+        self._connection_state = connection_state
+        self._namespace_path = list(namespace_path or [])
+        self._checkout_version: Optional[int] = None
+        # The branch this handle is scoped to (None == main). Persisted so a
+        # fork/pickle reopen restores the branch instead of reverting to main.
+        self._branch: Optional[str] = None
+        self._pid = os.getpid()
+
+    def _serialized_connection_state(self) -> str:
+        if self._connection_state is None:
+            raise RuntimeError(
+                "Cannot reopen this remote table because it does not carry "
+                "serialized connection state"
+            )
+        if callable(self._connection_state):
+            self._connection_state = self._connection_state()
+        return self._connection_state
+
+    @property
+    def _table(self) -> AsyncTable:
+        self._ensure_open()
+        assert self._table_handle is not None
+        return self._table_handle
+
+    @_table.setter
+    def _table(self, table: AsyncTable) -> None:
+        self._table_handle = table
+        self._name = table.name
+        self._pid = os.getpid()
+
+    def _ensure_open(self) -> None:
+        pid = os.getpid()
+        if self._table_handle is not None and self._pid == pid:
+            return
+
+        # Pickle clears the handle; fork inherits a handle created in the
+        # parent process. In both cases reopen before touching the Rust client.
+        from lancedb import deserialize_conn
+
+        db = deserialize_conn(self._serialized_connection_state(), for_worker=True)
+        # Reopen on the same branch and pinned version (branch=None / version=None
+        # reproduce the plain main-latest open).
+        table = db.open_table(
+            self._name,
+            namespace_path=self._namespace_path,
+            branch=self._branch,
+            version=self._checkout_version,
+        )
+
+        self._table_handle = table._table
+        self.db_name = table.db_name
+        self._pid = pid
+
+    def __getstate__(self) -> dict:
+        return {
+            "connection_state": self._serialized_connection_state(),
+            "db_name": self.db_name,
+            "name": self.name,
+            "namespace_path": self._namespace_path,
+            "checkout_version": self._checkout_version,
+            "branch": self._branch,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        self._table_handle = None
+        self._name = state["name"]
+        self.db_name = state["db_name"]
+        self._connection_state = state["connection_state"]
+        self._namespace_path = state["namespace_path"]
+        self._checkout_version = state["checkout_version"]
+        self._branch = state.get("branch")
+        self._pid = None
+
+    @property
+    def name(self) -> str:
+        """The name of the table"""
+        return self._name
+
+    def __repr__(self) -> str:
+        return f"RemoteTable({self.db_name}.{self.name})"
+
+    @property
+    def schema(self) -> pa.Schema:
+        """The [Arrow Schema](https://arrow.apache.org/docs/python/api/datatypes.html#)
+        of this Table
+
+        """
+        return LOOP.run(self._table.schema())
+
+    @property
+    def version(self) -> int:
+        """Get the current version of the table"""
+        return LOOP.run(self._table.version())
+
+    @property
+    def tags(self) -> Tags:
+        return Tags(self._table)
+
+    @property
+    def branches(self) -> Branches:
+        """Branch management for the table.
+
+        ``create``/``checkout`` return a new table handle scoped to the branch;
+        writes on it do not affect ``main``.
+        """
+        return Branches(self)
+
+    def current_branch(self) -> Optional[str]:
+        """The branch this table handle is scoped to, or ``None`` for ``main``."""
+        return self._table.current_branch()
+
+    def _wrap_branch_handle(
+        self, async_table: AsyncTable, version: Optional[int] = None
+    ) -> "RemoteTable":
+        # A branch handle stays a RemoteTable with the same connection context.
+        # Record the branch and version pin so a fork/pickle reopen restores both.
+        handle = RemoteTable(
+            async_table,
+            self.db_name,
+            connection_state=self._connection_state,
+            namespace_path=self._namespace_path,
+        )
+        handle._branch = async_table.current_branch()
+        handle._checkout_version = version
+        return handle
+
+    @cached_property
+    def embedding_functions(self) -> Dict[str, EmbeddingFunctionConfig]:
+        """
+        Get the embedding functions for the table
+
+        Returns
+        -------
+        funcs: dict
+            A mapping of the vector column to the embedding function
+            or empty dict if not configured.
+        """
+        return EmbeddingFunctionRegistry.get_instance().parse_functions(
+            self.schema.metadata
+        )
+
+    def list_versions(self):
+        """List all versions of the table"""
+        return LOOP.run(self._table.list_versions())
+
+    def to_arrow(self) -> pa.Table:
+        """to_arrow() is not yet supported on LanceDB cloud."""
+        raise NotImplementedError("to_arrow() is not yet supported on LanceDB cloud.")
+
+    def to_pandas(self, blob_mode: BlobMode = "lazy", **kwargs):
+        """to_pandas() is not yet supported on LanceDB cloud."""
+        raise NotImplementedError("to_pandas() is not yet supported on LanceDB cloud.")
+
+    def checkout(self, version: Union[int, str]):
+        result = LOOP.run(self._table.checkout(version))
+        self._checkout_version = self.version
+        return result
+
+    def checkout_latest(self):
+        result = LOOP.run(self._table.checkout_latest())
+        self._checkout_version = None
+        return result
+
+    def restore(self, version: Optional[Union[int, str]] = None):
+        result = LOOP.run(self._table.restore(version))
+        self._checkout_version = None
+        return result
+
+    def list_indices(self) -> Iterable[IndexConfig]:
+        """List all the indices on the table"""
+        return LOOP.run(self._table.list_indices())
+
+    def tokenize(
+        self,
+        query: str,
+        *,
+        column: Optional[str] = None,
+        index_name: Optional[str] = None,
+    ) -> Iterable[FtsToken]:
+        """Tokenize a query using the tokenizer configured on an FTS index.
+
+        Model-backed tokenizers such as ``jieba/*`` and ``lindera/*`` are
+        rebuilt in the client process from index metadata, so the same tokenizer
+        model files must exist locally.
+        """
+        return LOOP.run(
+            self._table.tokenize(query, column=column, index_name=index_name)
+        )
+
+    def index_stats(self, index_uuid: str) -> Optional[IndexStatistics]:
+        """List all the stats of a specified index"""
+        return LOOP.run(self._table.index_stats(index_uuid))
+
+    @deprecation.deprecated(
+        deprecated_in="0.25.0",
+        current_version=__version__,
+        details="Use create_index() with config=BTree()/Bitmap()/LabelList() instead.",
+    )
+    def create_scalar_index(
+        self,
+        column: str,
+        index_type: Literal["BTREE", "BITMAP", "LABEL_LIST", "scalar"] = "scalar",
+        *,
+        replace: bool = False,
+        wait_timeout: Optional[timedelta] = None,
+        name: Optional[str] = None,
+    ):
+        """Creates a scalar index.
+
+        .. deprecated:: 0.25.0
+            Use :meth:`create_index` with a BTree, Bitmap, or LabelList config instead.
+            Example: ``table.create_index("column", config=BTree())``
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.  Must be a boolean, integer, float,
+            or string column.
+        index_type : str
+            The index type of the scalar index. Must be "scalar" (BTREE),
+            "BTREE", "BITMAP", or "LABEL_LIST",
+        replace : bool
+            If True, replace the existing index with the new one.
+        """
+        if index_type == "scalar" or index_type == "BTREE":
+            config = BTree()
+        elif index_type == "BITMAP":
+            config = Bitmap()
+        elif index_type == "LABEL_LIST":
+            config = LabelList()
+        else:
+            raise ValueError(f"Unknown index type: {index_type}")
+
+        LOOP.run(
+            self._table.create_index(
+                column,
+                config=config,
+                replace=replace,
+                wait_timeout=wait_timeout,
+                name=name,
+            )
+        )
+
+    @deprecation.deprecated(
+        deprecated_in="0.25.0",
+        current_version=__version__,
+        details="Use create_index() with config=FTS() instead.",
+    )
+    def create_fts_index(
+        self,
+        column: str,
+        *,
+        replace: bool = False,
+        wait_timeout: Optional[timedelta] = None,
+        with_position: bool = False,
+        # tokenizer configs:
+        base_tokenizer: BaseTokenizerType = "simple",
+        language: str = "English",
+        max_token_length: Optional[int] = 40,
+        lower_case: bool = True,
+        stem: bool = True,
+        remove_stop_words: bool = True,
+        custom_stop_words: Optional[List[str]] = None,
+        ascii_folding: bool = True,
+        ngram_min_length: int = 3,
+        ngram_max_length: int = 3,
+        prefix_only: bool = False,
+        block_size: int = 128,
+        name: Optional[str] = None,
+    ):
+        """Create a full-text search index on a column.
+
+        .. deprecated:: 0.25.0
+            Use :meth:`create_index` with an FTS config instead.
+            Example: ``table.create_index("text_column", config=FTS())``
+        """
+        config = FTS(
+            with_position=with_position,
+            base_tokenizer=base_tokenizer,
+            language=language,
+            max_token_length=max_token_length,
+            lower_case=lower_case,
+            stem=stem,
+            remove_stop_words=remove_stop_words,
+            custom_stop_words=custom_stop_words,
+            ascii_folding=ascii_folding,
+            ngram_min_length=ngram_min_length,
+            ngram_max_length=ngram_max_length,
+            prefix_only=prefix_only,
+            block_size=block_size,
+        )
+        LOOP.run(
+            self._table.create_index(
+                column,
+                config=config,
+                replace=replace,
+                wait_timeout=wait_timeout,
+                name=name,
+            )
+        )
+
+    # New unified API overload
+    @overload
+    def create_index(
+        self,
+        column: str,
+        /,
+        *,
+        config: IndexConfigType,
+        wait_timeout: Optional[timedelta] = ...,
+        name: Optional[str] = ...,
+        train: bool = ...,
+    ) -> None: ...
+
+    # Legacy API overload (deprecated)
+    @overload
+    def create_index(
+        self,
+        metric: Literal["l2", "cosine", "dot", "hamming"] = ...,
+        vector_column_name: str = ...,
+        index_cache_size: Optional[int] = ...,
+        num_partitions: Optional[int] = ...,
+        num_sub_vectors: Optional[int] = ...,
+        replace: Optional[bool] = ...,
+        accelerator: Optional[str] = ...,
+        index_type: Literal[
+            "VECTOR", "IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_SQ", "IVF_HNSW_PQ"
+        ] = ...,
+        wait_timeout: Optional[timedelta] = ...,
+        *,
+        num_bits: int = ...,
+        name: Optional[str] = ...,
+        train: bool = ...,
+    ) -> None: ...
+
+    def create_index(
+        self,
+        metric: str = "l2",
+        vector_column_name: str = VECTOR_COLUMN_NAME,
+        index_cache_size: Optional[int] = None,
+        num_partitions: Optional[int] = None,
+        num_sub_vectors: Optional[int] = None,
+        replace: Optional[bool] = None,
+        accelerator: Optional[str] = None,
+        index_type="vector",
+        wait_timeout: Optional[timedelta] = None,
+        *,
+        num_bits: int = 8,
+        config: Optional[IndexConfigType] = None,
+        name: Optional[str] = None,
+        train: bool = True,
+    ):
+        """Create an index on a column.
+
+        This method supports both the new unified API and the legacy API
+        for backwards compatibility. The new API takes the column name as the
+        first positional argument and an index configuration object via
+        ``config``; the legacy API takes the distance metric as the first
+        argument plus separate ``vector_column_name`` / ``num_partitions`` /
+        etc. parameters, and emits a ``DeprecationWarning``.
+
+        Examples
+        --------
+        New API (recommended):
+
+        >>> table.create_index(  # doctest: +SKIP
+        ...     "vector", config=IvfPq(distance_type="l2")
+        ... )
+        >>> table.create_index("category", config=BTree())  # doctest: +SKIP
+        >>> table.create_index("content", config=FTS())  # doctest: +SKIP
+
+        Legacy API (deprecated):
+
+        >>> table.create_index(  # doctest: +SKIP
+        ...     "l2", vector_column_name="vector"
+        ... )
+        """
+        # Detect whether this is a legacy API call
+        is_legacy = self._is_legacy_create_index_call(
+            metric,
+            config,
+            num_partitions,
+            num_sub_vectors,
+            vector_column_name,
+            accelerator,
+            index_cache_size,
+            replace,
+        )
+
+        if is_legacy:
+            warnings.warn(
+                "The create_index() API with metric/num_partitions parameters is "
+                "deprecated and will be removed in a future version. "
+                "Please migrate to the new unified API:\n"
+                "  # Old (deprecated):\n"
+                "  table.create_index('l2', vector_column_name='my_vector')\n"
+                "  # New (recommended):\n"
+                "  table.create_index('my_vector', config=IvfPq(distance_type='l2'))",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+            column = vector_column_name
+
+            if accelerator is not None:
+                logging.warning(
+                    "GPU accelerator is not yet supported on LanceDB cloud."
+                    "If you have 100M+ vectors to index,"
+                    "please contact us at contact@lancedb.com"
+                )
+            if replace is not None:
+                logging.warning(
+                    "replace is not supported on LanceDB cloud."
+                    "Existing indexes will always be replaced."
+                )
+
+            idx_type = index_type.upper()
+            if idx_type == "VECTOR" or idx_type == "IVF_PQ":
+                config = IvfPq(
+                    distance_type=metric,
+                    num_partitions=num_partitions,
+                    num_sub_vectors=num_sub_vectors,
+                    num_bits=num_bits,
+                )
+            elif idx_type == "IVF_RQ":
+                config = IvfRq(
+                    distance_type=metric,
+                    num_partitions=num_partitions,
+                    num_bits=num_bits,
+                )
+            elif idx_type == "IVF_SQ":
+                config = IvfSq(distance_type=metric, num_partitions=num_partitions)
+            elif idx_type == "IVF_HNSW_PQ":
+                raise ValueError(
+                    "IVF_HNSW_PQ is not supported on LanceDB cloud."
+                    "Please use IVF_HNSW_SQ instead."
+                )
+            elif idx_type == "IVF_HNSW_SQ":
+                config = HnswSq(distance_type=metric, num_partitions=num_partitions)
+            elif idx_type == "IVF_HNSW_FLAT":
+                config = HnswFlat(distance_type=metric, num_partitions=num_partitions)
+            elif idx_type == "IVF_FLAT":
+                config = IvfFlat(distance_type=metric, num_partitions=num_partitions)
+            else:
+                raise ValueError(
+                    f"Unknown vector index type: {idx_type}. Valid options are"
+                    " 'IVF_FLAT', 'IVF_PQ', 'IVF_RQ', 'IVF_SQ',"
+                    " 'IVF_HNSW_PQ', 'IVF_HNSW_SQ', 'IVF_HNSW_FLAT'"
+                )
+        else:
+            column = metric
+
+        LOOP.run(
+            self._table.create_index(
+                column,
+                config=config,
+                wait_timeout=wait_timeout,
+                name=name,
+                train=train,
+            )
+        )
+
+    def create_index_async(
+        self,
+        column: str,
+        *,
+        config: IndexConfigType,
+        replace: Optional[bool] = None,
+        wait_timeout: Optional[timedelta] = None,
+        name: Optional[str] = None,
+        train: bool = True,
+    ) -> Job:
+        """Create an index, returning a handle to the indexing job.
+
+        The job may already be complete when returned; callers must not assume
+        the index exists until :meth:`Job.wait` returns.
+        """
+        return Job(
+            LOOP.run(
+                self._table.create_index_async(
+                    column,
+                    replace=replace,
+                    config=config,
+                    wait_timeout=wait_timeout,
+                    name=name,
+                    train=train,
+                )
+            )
+        )
+
+    def _is_legacy_create_index_call(
+        self,
+        first_arg: str,
+        config: Optional[IndexConfigType],
+        num_partitions: Optional[int],
+        num_sub_vectors: Optional[int],
+        vector_column_name: str,
+        accelerator: Optional[str],
+        index_cache_size: Optional[int],
+        replace: Optional[bool],
+    ) -> bool:
+        """Detect if this is a legacy create_index call."""
+        if config is not None:
+            return False
+        if any(
+            x is not None
+            for x in (
+                num_partitions,
+                num_sub_vectors,
+                accelerator,
+                index_cache_size,
+                replace,
+            )
+        ):
+            return True
+        if vector_column_name != VECTOR_COLUMN_NAME:
+            return True
+        if first_arg.lower() in KNOWN_METRICS:
+            return True
+        return False
+
+    def add(
+        self,
+        data: DATA,
+        mode: str = "append",
+        on_bad_vectors: str = "error",
+        fill_value: float = 0.0,
+        progress: Optional[Union[bool, Callable, Any]] = None,
+        write_parallelism: Optional[int] = None,
+    ) -> AddResult:
+        """Add more data to the [Table][lancedb.table.Table].
+
+        It has the same API signature as the OSS version.
+
+        Parameters
+        ----------
+        data: DATA
+            The data to insert into the table. Acceptable types are:
+
+            - dict or list-of-dict
+
+            - pandas.DataFrame
+
+            - pyarrow.Table or pyarrow.RecordBatch
+        mode: str
+            The mode to use when writing the data. Valid values are
+            "append" and "overwrite".
+        on_bad_vectors: str, default "error"
+            What to do if any of the vectors are not the same size or contains NaNs.
+            One of "error", "drop", "fill".
+        fill_value: float, default 0.
+            The value to use when filling vectors. Only used if on_bad_vectors="fill".
+        progress: bool, callable, or tqdm-like, optional
+            A callback or tqdm-compatible progress bar. See
+            :meth:`Table.add` for details.
+        write_parallelism: int, optional
+            Number of partitions to write in parallel. Higher values increase
+            throughput but also peak memory use, since each partition buffers
+            data in flight. Defaults to an estimate based on the data size,
+            capped at the number of CPU cores. Lower this if bulk ingestion is
+            using too much memory.
+
+        Returns
+        -------
+        AddResult
+            An object containing the new version number of the table after adding data.
+        """
+        progress, owns = _normalize_progress(progress)
+        try:
+            return LOOP.run(
+                self._table.add(
+                    data,
+                    mode=mode,
+                    on_bad_vectors=on_bad_vectors,
+                    fill_value=fill_value,
+                    progress=progress,
+                    write_parallelism=write_parallelism,
+                )
+            )
+        finally:
+            if owns:
+                progress.close()
+
+    def search(
+        self,
+        query: Union[VEC, str] = None,
+        vector_column_name: Optional[str] = None,
+        query_type="auto",
+        fts_columns: Optional[Union[str, List[str]]] = None,
+        fast_search: bool = False,
+    ) -> LanceVectorQueryBuilder:
+        """Create a search query to find the nearest neighbors
+        of the given query vector. We currently support
+        [vector search](https://lancedb.com/docs/search/vector-search/)
+
+        All query options are defined in
+        [LanceVectorQueryBuilder][lancedb.query.LanceVectorQueryBuilder].
+
+        Examples
+        --------
+        >>> import lancedb
+        >>> db = lancedb.connect("db://...", api_key="...", # doctest: +SKIP
+        ...                      region="...") # doctest: +SKIP
+        >>> data = [
+        ...    {"original_width": 100, "caption": "bar", "vector": [0.1, 2.3, 4.5]},
+        ...    {"original_width": 2000, "caption": "foo",  "vector": [0.5, 3.4, 1.3]},
+        ...    {"original_width": 3000, "caption": "test", "vector": [0.3, 6.2, 2.6]}
+        ... ]
+        >>> table = db.create_table("my_table", data) # doctest: +SKIP
+        >>> query = [0.4, 1.4, 2.4]
+        >>> (table.search(query) # doctest: +SKIP
+        ...     .where("original_width > 1000", prefilter=True) # doctest: +SKIP
+        ...     .select(["caption", "original_width"]) # doctest: +SKIP
+        ...     .limit(2) # doctest: +SKIP
+        ...     .to_pandas()) # doctest: +SKIP
+          caption  original_width           vector  _distance # doctest: +SKIP
+        0     foo            2000  [0.5, 3.4, 1.3]   5.220000 # doctest: +SKIP
+        1    test            3000  [0.3, 6.2, 2.6]  23.089996 # doctest: +SKIP
+
+        Parameters
+        ----------
+        query: list/np.ndarray/str/PIL.Image.Image, default None
+            The targetted vector to search for.
+
+            - *default None*.
+            Acceptable types are: list, np.ndarray, PIL.Image.Image
+
+        vector_column_name: str, optional
+            The name of the vector column to search.
+
+            - If not specified then the vector column is inferred from
+            the table schema
+
+            - If the table has multiple vector columns then the *vector_column_name*
+            needs to be specified. Otherwise, an error is raised.
+
+        fast_search: bool, optional
+            Skip a flat search of unindexed data. This may improve
+            search performance but search results will not include unindexed data.
+
+            - *default False*.
+
+        Returns
+        -------
+        LanceQueryBuilder
+            A query builder object representing the query.
+            Once executed, the query returns
+
+            - selected columns
+
+            - the vector
+
+            - and also the "_distance" column which is the distance between the query
+            vector and the returned vector.
+        """
+        return LanceQueryBuilder.create(
+            self,
+            query,
+            query_type,
+            vector_column_name=vector_column_name,
+            fts_columns=fts_columns,
+            fast_search=fast_search,
+        )
+
+    def _execute_query(
+        self,
+        query: Query,
+        *,
+        batch_size: Optional[int] = None,
+        timeout: Optional[timedelta] = None,
+    ) -> pa.RecordBatchReader:
+        async_iter = LOOP.run(
+            self._table._execute_query(query, batch_size=batch_size, timeout=timeout)
+        )
+
+        def iter_sync():
+            try:
+                while True:
+                    yield LOOP.run(async_iter.__anext__())
+            except StopAsyncIteration:
+                return
+
+        return pa.RecordBatchReader.from_batches(async_iter.schema, iter_sync())
+
+    def _explain_plan(self, query: Query, verbose: Optional[bool] = False) -> str:
+        return LOOP.run(self._table._explain_plan(query, verbose))
+
+    def _analyze_plan(
+        self,
+        query: Query,
+        *,
+        distributed_metrics: AnalyzePlanDistributedMetrics = "aggregate",
+    ) -> str:
+        return LOOP.run(
+            self._table._analyze_plan(query, distributed_metrics=distributed_metrics)
+        )
+
+    def _output_schema(self, query: Query) -> pa.Schema:
+        return LOOP.run(self._table._output_schema(query))
+
+    def merge_insert(self, on: Union[str, Iterable[str]]) -> LanceMergeInsertBuilder:
+        """Returns a [`LanceMergeInsertBuilder`][lancedb.merge.LanceMergeInsertBuilder]
+        that can be used to create a "merge insert" operation.
+
+        See [`Table.merge_insert`][lancedb.table.Table.merge_insert] for more details.
+        """
+        return super().merge_insert(on)
+
+    def _do_merge(
+        self,
+        merge: LanceMergeInsertBuilder,
+        new_data: DATA,
+        on_bad_vectors: str,
+        fill_value: float,
+    ) -> MergeResult:
+        return LOOP.run(
+            self._table._do_merge(merge, new_data, on_bad_vectors, fill_value)
+        )
+
+    def delete(self, predicate: str) -> DeleteResult:
+        """Delete rows from the table.
+
+        This can be used to delete a single row, many rows, all rows, or
+        sometimes no rows (if your predicate matches nothing).
+
+        Parameters
+        ----------
+        predicate: str
+            The SQL where clause to use when deleting rows.
+
+            - For example, 'x = 2' or 'x IN (1, 2, 3)'.
+
+            The filter must not be empty, or it will error.
+
+        Returns
+        -------
+        DeleteResult
+            An object containing the new version number of the table after deletion.
+
+        Examples
+        --------
+        >>> import lancedb
+        >>> data = [
+        ...    {"x": 1, "vector": [1, 2]},
+        ...    {"x": 2, "vector": [3, 4]},
+        ...    {"x": 3, "vector": [5, 6]}
+        ... ]
+        >>> db = lancedb.connect("db://...", api_key="...", # doctest: +SKIP
+        ...                      region="...") # doctest: +SKIP
+        >>> table = db.create_table("my_table", data) # doctest: +SKIP
+        >>> table.search([10,10]).to_pandas() # doctest: +SKIP
+           x      vector  _distance # doctest: +SKIP
+        0  3  [5.0, 6.0]       41.0 # doctest: +SKIP
+        1  2  [3.0, 4.0]       85.0 # doctest: +SKIP
+        2  1  [1.0, 2.0]      145.0 # doctest: +SKIP
+        >>> table.delete("x = 2") # doctest: +SKIP
+        >>> table.search([10,10]).to_pandas() # doctest: +SKIP
+           x      vector  _distance # doctest: +SKIP
+        0  3  [5.0, 6.0]       41.0 # doctest: +SKIP
+        1  1  [1.0, 2.0]      145.0 # doctest: +SKIP
+
+        If you have a list of values to delete, you can combine them into a
+        stringified list and use the `IN` operator:
+
+        >>> to_remove = [1, 3] # doctest: +SKIP
+        >>> to_remove = ", ".join([str(v) for v in to_remove]) # doctest: +SKIP
+        >>> table.delete(f"x IN ({to_remove})") # doctest: +SKIP
+        >>> table.search([10,10]).to_pandas() # doctest: +SKIP
+           x      vector  _distance # doctest: +SKIP
+        0  2  [3.0, 4.0]       85.0 # doctest: +SKIP
+        """
+        return LOOP.run(self._table.delete(predicate))
+
+    def update(
+        self,
+        where: Optional[str] = None,
+        values: Optional[dict] = None,
+        *,
+        values_sql: Optional[Dict[str, str]] = None,
+    ) -> UpdateResult:
+        """
+        This can be used to update zero to all rows depending on how many
+        rows match the where clause.
+
+        Parameters
+        ----------
+        where: str, optional
+            The SQL where clause to use when updating rows. For example, 'x = 2'
+            or 'x IN (1, 2, 3)'. The filter must not be empty, or it will error.
+        values: dict, optional
+            The values to update. The keys are the column names and the values
+            are the values to set.
+        values_sql: dict, optional
+            The values to update, expressed as SQL expression strings. These can
+            reference existing columns. For example, {"x": "x + 1"} will increment
+            the x column by 1.
+
+        Returns
+        -------
+        UpdateResult
+            - rows_updated: The number of rows that were updated
+            - version: The new version number of the table after the update
+
+        Examples
+        --------
+        >>> import lancedb
+        >>> data = [
+        ...    {"x": 1, "vector": [1, 2]},
+        ...    {"x": 2, "vector": [3, 4]},
+        ...    {"x": 3, "vector": [5, 6]}
+        ... ]
+        >>> db = lancedb.connect("db://...", api_key="...", # doctest: +SKIP
+        ...                      region="...") # doctest: +SKIP
+        >>> table = db.create_table("my_table", data) # doctest: +SKIP
+        >>> table.to_pandas() # doctest: +SKIP
+           x      vector # doctest: +SKIP
+        0  1  [1.0, 2.0] # doctest: +SKIP
+        1  2  [3.0, 4.0] # doctest: +SKIP
+        2  3  [5.0, 6.0] # doctest: +SKIP
+        >>> table.update(where="x = 2", values={"vector": [10, 10]}) # doctest: +SKIP
+        >>> table.to_pandas() # doctest: +SKIP
+           x        vector # doctest: +SKIP
+        0  1    [1.0, 2.0] # doctest: +SKIP
+        1  3    [5.0, 6.0] # doctest: +SKIP
+        2  2  [10.0, 10.0] # doctest: +SKIP
+
+        """
+        return LOOP.run(
+            self._table.update(where=where, updates=values, updates_sql=values_sql)
+        )
+
+    def cleanup_old_versions(self, *_):
+        """
+        cleanup_old_versions() is a no-op on LanceDB Cloud.
+
+        Tables are automatically cleaned up and optimized.
+        """
+        warnings.warn(
+            "cleanup_old_versions() is a no-op on LanceDB Cloud. "
+            "Tables are automatically cleaned up and optimized.",
+            stacklevel=2,
+        )
+        pass
+
+    def compact_files(self, *_):
+        """
+        compact_files() is a no-op on LanceDB Cloud.
+
+        Tables are automatically compacted and optimized.
+        """
+        warnings.warn(
+            "compact_files() is a no-op on LanceDB Cloud. "
+            "Tables are automatically compacted and optimized.",
+            stacklevel=2,
+        )
+        pass
+
+    def optimize(
+        self,
+        *,
+        cleanup_older_than: Optional[timedelta] = None,
+        delete_unverified: bool = False,
+    ):
+        """
+        optimize() is a no-op on LanceDB Cloud.
+
+        Indices are optimized automatically.
+        """
+        warnings.warn(
+            "optimize() is a no-op on LanceDB Cloud. "
+            "Indices are optimized automatically.",
+            stacklevel=2,
+        )
+        pass
+
+    def count_rows(self, filter: Optional[str] = None) -> int:
+        return LOOP.run(self._table.count_rows(filter))
+
+    def add_columns(self, transforms: Dict[str, str]) -> AddColumnsResult:
+        return LOOP.run(self._table.add_columns(transforms))
+
+    def alter_columns(
+        self, *alterations: Iterable[Dict[str, str]]
+    ) -> AlterColumnsResult:
+        return LOOP.run(self._table.alter_columns(*alterations))
+
+    def update_field_metadata(
+        self, *updates: dict[str, Any]
+    ) -> UpdateFieldMetadataResult:
+        return LOOP.run(self._table.update_field_metadata(*updates))
+
+    def drop_columns(self, columns: Iterable[str]) -> DropColumnsResult:
+        return LOOP.run(self._table.drop_columns(columns))
+
+    def set_unenforced_primary_key(self, columns: Union[str, Iterable[str]]) -> None:
+        """Not supported on LanceDB Cloud."""
+        return LOOP.run(self._table.set_unenforced_primary_key(columns))
+
+    def set_lsm_write_spec(self, spec: "LsmWriteSpec") -> None:
+        """Not supported on LanceDB Cloud."""
+        return LOOP.run(self._table.set_lsm_write_spec(spec))
+
+    def unset_lsm_write_spec(self) -> None:
+        """Not supported on LanceDB Cloud."""
+        return LOOP.run(self._table.unset_lsm_write_spec())
+
+    def get_lsm_write_spec(self) -> Optional["LsmWriteSpec"]:
+        """Read the installed LsmWriteSpec, or ``None``."""
+        return LOOP.run(self._table.get_lsm_write_spec())
+
+    def close_lsm_writers(self) -> None:
+        """No-op on LanceDB Cloud (no local shard writers)."""
+        return LOOP.run(self._table.close_lsm_writers())
+
+    def drop_index(self, index_name: str):
+        return LOOP.run(self._table.drop_index(index_name))
+
+    def prewarm_index(self, name: str) -> None:
+        """Prewarm an index in the table.
+
+        This is a hint to the database that the index will be accessed in the
+        future and should be loaded into memory if possible.  This can reduce
+        cold-start latency for subsequent queries.
+
+        This call initiates prewarming and returns once the request is accepted.
+        It is idempotent and safe to call from multiple clients concurrently.
+
+        Parameters
+        ----------
+        name: str
+            The name of the index to prewarm
+        """
+        return LOOP.run(self._table.prewarm_index(name))
+
+    def prewarm_data(self, columns: Optional[List[str]] = None) -> None:
+        """Prewarm data for the table.
+
+        This is a hint to the database that the given columns will be accessed
+        in the future and the database should prefetch the data if possible.
+        Currently only supported on remote tables.
+
+        This call initiates prewarming and returns once the request is accepted.
+        It is idempotent and safe to call from multiple clients concurrently.
+
+        This operation has a large upfront cost but can speed up future queries
+        that need to fetch the given columns.  Large columns such as embeddings
+        or binary data may not be practical to prewarm.  This feature is intended
+        for workloads that issue many queries against the same columns.
+
+        Parameters
+        ----------
+        columns: list of str, optional
+            The columns to prewarm. If None, all columns are prewarmed.
+        """
+        return LOOP.run(self._table.prewarm_data(columns))
+
+    def wait_for_index(
+        self, index_names: Iterable[str], timeout: timedelta = timedelta(seconds=300)
+    ):
+        return LOOP.run(self._table.wait_for_index(index_names, timeout))
+
+    def stats(self):
+        return LOOP.run(self._table.stats())
+
+    @property
+    def uri(self) -> str:
+        """The table URI (storage location).
+
+        For remote tables, this fetches the location from the server via describe.
+        """
+        return LOOP.run(self._table.uri())
+
+    def take_offsets(self, offsets: list[int]) -> LanceTakeQueryBuilder:
+        return LanceTakeQueryBuilder(self._table.take_offsets(offsets))
+
+    def take_row_ids(self, row_ids: list[int]) -> LanceTakeQueryBuilder:
+        return LanceTakeQueryBuilder(self._table.take_row_ids(row_ids))
+
+    def uses_v2_manifest_paths(self) -> bool:
+        raise NotImplementedError(
+            "uses_v2_manifest_paths() is not supported on the LanceDB Cloud"
+        )
+
+    def migrate_v2_manifest_paths(self):
+        raise NotImplementedError(
+            "migrate_v2_manifest_paths() is not supported on the LanceDB Cloud"
+        )
+
+    def blob_columns(self) -> list[str]:
+        return LOOP.run(self._table.blob_columns())
+
+    def fetch_blobs(
+        self, column: str, row_ids: Union[list[int], pa.Table]
+    ) -> pa.LargeBinaryArray:
+        return LOOP.run(self._table.fetch_blobs(column, row_ids))
+
+    def fetch_blob_ranges(self, column: str, requests) -> pa.LargeBinaryArray:
+        raise NotImplementedError(
+            "fetch_blob_ranges() is not supported on LanceDB Cloud"
+        )
+
+    def fetch_blob_files(
+        self, column: str, row_ids: Union[list[int], pa.Table]
+    ) -> "list[Optional[BlobFile]]":
+        return LOOP.run(self._table.fetch_blob_files(column, row_ids))
+
+    def head(self, n=5) -> pa.Table:
+        """
+        Return the first `n` rows of the table.
+
+        Parameters
+        ----------
+        n: int, default 5
+            The number of rows to return.
+        """
+        return LOOP.run(self._table.query().limit(n).to_arrow())
+
+
+def add_index(tbl: pa.Table, i: int) -> pa.Table:
+    return tbl.add_column(
+        0,
+        pa.field("query_index", pa.uint32()),
+        pa.array([i] * len(tbl), pa.uint32()),
+    )
