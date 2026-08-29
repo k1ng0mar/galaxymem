@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galaxymem"
-version = "0.2.1"
+version = "0.2.2"
 description = "Entity-scoped memory with four-network epistemic split, decay, and autonomous reflection. SQLite-backed."
 readme = "README.md"
 license = {file = "LICENSE"}
