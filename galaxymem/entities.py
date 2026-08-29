@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .models import EntityRecord, EntityType, IdentityLink, LinkMethod, MemoryStatus
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def create_entity(
     """Create a new entity with an auto-generated or explicit slug.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         label: Human-readable name.
         entity_type: self, person, project, or provisional.
         card: Optional metadata dict (free-form).
@@ -151,7 +151,7 @@ def create_provisional(
     is encountered that doesn't match any existing identity link.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         platform: Platform name (e.g. "telegram", "discord", "cli").
         external_id: Platform-specific user ID.
         label: Optional display label; defaults to "{platform}:{external_id}".
@@ -195,7 +195,7 @@ def merge_entity(
     This is an explicit user action — never auto-inferred.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         source_id: The entity to merge FROM (will be marked merged_into).
         target_id: The entity to merge INTO (receives everything).
 
@@ -249,7 +249,7 @@ def resolve_or_provision(
     Otherwise, creates a new provisional entity and links it.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         platform: Platform name (e.g. "telegram", "discord", "cli").
         external_id: Platform-specific user ID.
         label: Optional display label for new provisional entity.
@@ -281,7 +281,7 @@ def link_identity_explicit(
     Never auto-inferred.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         platform: Platform name.
         external_id: Platform-specific user ID.
         entity_id: The entity to link to.

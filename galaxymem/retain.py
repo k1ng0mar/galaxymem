@@ -28,7 +28,7 @@ from .models import (
     MemoryStatus,
     Network,
 )
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +271,7 @@ def flag_turn(
     If the turn matches any flag rule, creates a FlagRecord in the store.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         turn_text: The conversation turn text.
         session_id: Session identifier.
         platform: Platform name (e.g. "telegram", "discord").
@@ -332,7 +332,7 @@ def should_trigger_pass2(store: Store, session_id: Optional[str] = None) -> bool
     - Oldest unprocessed flag is older than PASS2_IDLE_MINUTES
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         session_id: Optional session to scope the check.
 
     Returns:
@@ -383,7 +383,7 @@ For each turn, extract zero or more memories. Each memory must have:
 - text: A concise, SELF-CONTAINED restatement of the fact/opinion/observation (1-2 sentences max). It must be readable without the conversation: resolve pronouns, include names and dates.
 - network: One of "world" (objective facts), "experience" (events/actions), "opinion" (preferences/views), "observation" (patterns/insights)
 - entity_labels: Who or what the memory is ABOUT — NOT who said it. A fact Sarah states about the Hermes project is filed under ["Hermes"], not ["Sarah"]. Use short names. Leave empty if it is general knowledge about no tracked person/project.
-- canonical_key: A canonicalized fact key used for deduplication AND consistency across sessions. Format: "subject|predicate|object" (lowercase, no spaces in each component, use hyphens), e.g. "user|name-is|umar", "hermes|uses|lancedb", "umar|works-on|galaxymem". Different phrasings of the same fact MUST produce the SAME canonical_key. This is the consistency layer.
+- canonical_key: A canonicalized fact key used for deduplication AND consistency across sessions. Format: "subject|predicate|object" (lowercase, no spaces in each component, use hyphens), e.g. "user|name-is|umar", "hermes|uses|sqlite", "umar|works-on|galaxymem". Different phrasings of the same fact MUST produce the SAME canonical_key. This is the consistency layer.
 - memory_ids: An array of the flag_id(s) this memory was inferred from (see the (flag_id: ...) markers on each numbered turn). Use only flag_ids shown in the input. Omit or use [] if no specific flag applies.
 
 Classify network conservatively: when unsure between "world" and "opinion", choose "opinion" — it is the revisable bucket, and misfiling an inference as a world fact is the worse error.
@@ -493,7 +493,7 @@ def process_pending_flags(
     as processed.
 
     Args:
-        store: The LanceDB store.
+        store: The SQLite store.
         llm_client: An object with a .complete(prompt) -> str method.
         session_id: Optional session to scope processing.
         batch_size: Max flags per LLM call (default 10).

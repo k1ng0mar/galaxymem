@@ -4,7 +4,7 @@ import tempfile
 
 from galaxymem import config as cfg
 from galaxymem.retain import flag_turn, process_pending_flags
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 class BoomClient:

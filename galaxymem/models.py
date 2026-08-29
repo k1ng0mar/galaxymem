@@ -92,7 +92,7 @@ class SessionSummary(BaseModel):
     """Rolling compressed summary of a conversation session.
 
     One per session. Updated as messages accumulate — keeps the last
-    N_MEMORY_TOKENS of compressed context. Stored as a regular LanceDB table
+    N_MEMORY_TOKENS of compressed context. Stored as a regular SQLite table
     so it participates in the same vector/DB fabric as memories (reuses
     creating, searching, and versioning).
     """

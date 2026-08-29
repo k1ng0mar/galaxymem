@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galaxymem"
-version = "0.1.1"
-description = "Entity-scoped memory with four-network epistemic split, decay, and autonomous reflection. LanceDB-backed."
+version = "0.2.0"
+description = "Entity-scoped memory with four-network epistemic split, decay, and autonomous reflection. SQLite-backed."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 authors = [
     {name = "GalaxyMem Contributors"},
 ]
-keywords = ["memory", "ai", "agent", "lancedb", "epistemic", "entity-scoped"]
+keywords = ["memory", "ai", "agent", "sqlite", "epistemic", "entity-scoped"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -27,12 +27,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "lancedb>=0.6.0",
     "fastembed>=0.3.0",
     "pydantic>=2.0.0",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
     "requests>=2.28.0",
+    "sqlite-vec>=0.1.0",
 ]
 
 [project.optional-dependencies]

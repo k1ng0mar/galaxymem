@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from galaxymem import reflect
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 class StubLLM:
@@ -24,7 +24,7 @@ def _fresh_store(tmpdir) -> Store:
 def test_reflect_skipped_when_lock_held():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = _fresh_store(tmpdir)
-        lock_path = Path(store.db_path) / "reflect.lock"
+        lock_path = reflect._lock_path(store)
         lock_path.write_text(str(time.time()))
 
         report = reflect.run_reflection(store, StubLLM())
@@ -35,7 +35,7 @@ def test_reflect_skipped_when_lock_held():
 def test_reflect_steals_stale_lock():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = _fresh_store(tmpdir)
-        lock_path = Path(store.db_path) / "reflect.lock"
+        lock_path = reflect._lock_path(store)
         # Lock from 31 minutes ago — holder must have crashed.
         stale = time.time() - (reflect._LOCK_STALE_SECS + 60)
         lock_path.write_text(str(stale))
@@ -53,7 +53,7 @@ def test_reflect_releases_lock_on_success():
         store = _fresh_store(tmpdir)
         report = reflect.run_reflection(store, StubLLM())
         assert report.get("status") != "skipped"
-        lock_path = Path(store.db_path) / "reflect.lock"
+        lock_path = reflect._lock_path(store)
         assert not lock_path.exists()
         store.close()
 

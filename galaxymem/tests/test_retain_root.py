@@ -16,7 +16,7 @@ from pathlib import Path
 from galaxymem.entities import create_entity
 from galaxymem.models import EntityType, MemoryStatus, Network
 from galaxymem.retain import flag_turn, process_pending_flags, should_trigger_pass2
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 class MockLLMClient:

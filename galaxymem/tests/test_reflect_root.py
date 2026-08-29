@@ -31,7 +31,7 @@ from galaxymem.reflect import (
     run_reflection,
     should_reflect,
 )
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 from galaxymem import config as cfg
 
 
@@ -68,8 +68,8 @@ class MockLLMClient:
 def temp_store():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test_db"
-        with patch("galaxymem.store.embed_text", side_effect=_mock_embed_text), \
-             patch("galaxymem.store.embed_texts", side_effect=_mock_embed_texts):
+        with patch("galaxymem.embed.embed_text", side_effect=_mock_embed_text), \
+             patch("galaxymem.embed.embed_texts", side_effect=_mock_embed_texts):
             store = Store(db_path)
             store.open(create_if_missing=True)
             yield store

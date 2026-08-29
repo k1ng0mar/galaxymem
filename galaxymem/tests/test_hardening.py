@@ -67,98 +67,10 @@ from galaxymem.retain import (
     _sanitize_turn_text,
     flag_turn,
 )
-from galaxymem.schema import _esc
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 # ── _esc hardening ───────────────────────────────────────────────────────────
-
-class TestEscHardening:
-    """Validate that _esc handles malicious input correctly."""
-
-    def test_esc_basic_escape(self):
-        assert _esc('simple') == 'simple'
-
-    def test_esc_double_quote(self):
-        assert _esc('he said "hi"') == 'he said \\"hi\\"'
-
-    def test_esc_backslash(self):
-        assert _esc('path\\to\\file') == 'path\\\\to\\\\file'
-
-    def test_esc_single_quote(self):
-        assert _esc("don't") == "don\\'t"
-
-    def test_esc_newline(self):
-        assert _esc("line1\nline2") == "line1\\nline2"
-        assert _esc("line1\rline2") == "line1\\rline2"
-
-    def test_esc_null_byte(self):
-        assert _esc("hello\x00world") == "helloworld"
-
-    def test_esc_carriage_return(self):
-        assert _esc("hello\rworld") == "hello\\rworld"
-
-    def test_esc_like_wildcards(self):
-        bs = chr(92)  # the string escape mechanism mangles test strings
-        for raw, expected in [(r"%", bs + "%"), (r"_", bs + "_")]:
-            actual = _esc(raw, escape_like=True)
-            assert actual == expected, f"_esc({raw!r}, escape_like=True)={actual!r} expected {expected!r}"
-
-    def test_esc_like_brackets(self):
-        bs = chr(92)
-        actual = _esc(r"[like]", escape_like=True)
-        assert actual == bs + "[like" + bs + "]", f"got {actual!r}"
-
-    def test_esc_no_like_without_flag(self):
-        for raw, expected in [(r"%", r"%"), (r"_", r"_")]:
-            assert _esc(raw, escape_like=False) == expected
-
-    def test_esc_sql_injection_attempt(self):
-        """SQL injection should be defused."""
-        malicious = '" OR 1=1 --'
-        escaped = _esc(malicious)
-        assert '\\"' in escaped  # quote escaped
-        assert '--' in escaped  # -- is still there but escaped as literal
-
-        # More complex injection
-        complex_inj = "' UNION SELECT * FROM secrets --"
-        escaped = _esc(complex_inj)
-        assert "\\'" in escaped
-
-    def test_esc_non_string_types(self):
-        bs = chr(92)
-        assert _esc(42) == '42'
-        assert _esc(None) == ''
-        assert _esc(True) == 'True'
-        # The _esc function escapes single quotes too, so non-string types
-        # get their repr escaped (quirk — documents existing behaviour).
-        result = _esc(['a', 'b'])
-        assert "\\'a\\'" in result and "\\'b\\'" in result  # single-quotes escaped
-        dict_result = _esc({"key": "val"})
-        assert "\\'key\\'" in dict_result and "\\'val\\'" in dict_result
-
-    def test_esc_entity_membership_clause(self):
-        """Entity IDs with injection should not break the filter."""
-        from galaxymem.store import _entity_membership_clause
-        clause = _entity_membership_clause(['normal-id', 'evil" OR 1=1 --'])
-        # The malicious entity ID should be escaped inside the LIKE
-        assert 'evil\\" OR 1=1 --' in clause
-
-    def test_esc_unicode(self):
-        """Unicode text should survive _esc."""
-        text = "你好世界 🌍 مرحبا"
-        assert _esc(text) == text
-
-    def test_esc_entity_ids_with_keywords(self):
-        """Entity labels matching SQL keywords get escaped."""
-        from galaxymem.store import _entity_membership_clause
-        for kw in ['" OR ',"' UNION","\" WHERE "]:
-            clause = _entity_membership_clause([kw])
-            # Should still contain the keyword but escaped so it doesn't parse as SQL.
-            assert kw.replace('"','\\"').replace("'","\\'") in clause or '\\' in clause
-
-
-# ── Prompt injection mitigation ─────────────────────────────────────────────
 
 class TestPromptInjection:
     """Validate that user text in LLM prompts is sanitized."""
@@ -267,7 +179,7 @@ class TestParseJsonObject:
 # ── DB size limits ─────────────────────────────────────────────────────────────
 
 class _FakeStore:
-    """Minimal store mock for testing limits without real lancedb."""
+    """Minimal store mock for testing limits without a real DB."""
 
     def __init__(self, mem_count=0, ent_count=0, flag_count=0):
         self._memories = MagicMock()
@@ -281,6 +193,18 @@ class _FakeStore:
         self._max_memories = mem_count
         self._max_entities = ent_count
         self._max_flags = flag_count
+        # SQLite-style _query: return a count row for memories
+        self._conn = MagicMock()
+        self._closed = False
+        self._mem_count = mem_count
+
+    def _assert_writable(self):
+        pass
+
+    def _query(self, sql, params=()):
+        if "FROM memories" in sql:
+            return [{"c": self._mem_count}]
+        return [{"c": 0}]
 
     def unprocessed_flag_count(self, session_id=None):
         return self._max_flags

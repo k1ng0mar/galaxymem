@@ -37,7 +37,7 @@ from galaxymem.retain import (
     _parse_llm_response,
     _process_batch,
 )
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 
 
 # ── A: Reranker ────────────────────────────────────────────────────────────

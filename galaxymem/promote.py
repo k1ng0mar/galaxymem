@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 from . import config as cfg
 from .models import MemoryRecord, MemoryStatus
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 

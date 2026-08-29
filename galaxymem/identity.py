@@ -21,7 +21,7 @@ from .entities import (
     resolve_or_provision,
 )
 from .models import EntityType, IdentityLink
-from .store import Store
+from .store_sqlite import Store
 
 logger = logging.getLogger(__name__)
 

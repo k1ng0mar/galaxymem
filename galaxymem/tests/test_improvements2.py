@@ -20,7 +20,6 @@ from galaxymem.reason import gather_context
 class TestEvidenceQuotes:
     def test_validate_keeps_only_verbatim_quotes(self, temp_db, sample_memory):
         # sample_memory has some text; create by_id with it
-        from galaxymem.store import _from_memory
         # just use the sample_memory object directly
         by_id = {sample_memory.id: sample_memory}
         quotes = _validate_evidence_quotes(

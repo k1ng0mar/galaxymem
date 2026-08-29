@@ -12,7 +12,7 @@ Tests the full memory lifecycle:
 
 import pytest
 from datetime import datetime, timezone, timedelta
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 from galaxymem.models import (
     MemoryRecord, Network, MemoryStatus,
     EntityType, EdgeRecord, EdgeKind,

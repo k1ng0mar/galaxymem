@@ -8,7 +8,7 @@ import pytest
 from pathlib import Path
 from datetime import datetime, timezone
 
-from galaxymem.store import Store
+from galaxymem.store_sqlite import Store
 from galaxymem.models import (
     MemoryRecord,
     EntityRecord,
