@@ -1250,11 +1250,17 @@ class Store:
                 )
 
     def consume_flags(self, session_id: str) -> list[FlagRecord]:
+        """Get and mark all unprocessed flags for a session atomically.
+
+        Reads + marks inside the write lock so two concurrent consumers
+        cannot both claim the same flags (read-then-write race).
+        """
         self._assert_writable()
-        flags = [f for f in self.unprocessed_flags(session_id) if f.session_id == session_id]
-        if flags:
-            self.mark_flags_processed([f.id for f in flags])
-        return flags
+        with self._write_lock:
+            flags = [f for f in self.unprocessed_flags(session_id) if f.session_id == session_id]
+            if flags:
+                self.mark_flags_processed([f.id for f in flags])
+            return flags
 
     # ── Promotion Queue ─────────────────────────────────────────────────
 

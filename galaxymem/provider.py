@@ -490,9 +490,33 @@ GM_REASON_SCHEMA = {
     },
 }
 
-
-# ---------------------------------------------------------------------------
-# GalaxyMemProvider
+GM_EXPLAIN_RECALL_SCHEMA = {
+    "name": "gm_explain_recall",
+    "description": (
+        "Explain why each memory was selected for a recall query. Returns the "
+        "same top-k memories as gm_recall, but each with a provenance dict "
+        "showing which retrieval arms contributed (vector, keyword, spreading "
+        "activation) and the score breakdown. Use to debug or audit recall."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "entities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Entity ids/labels to scope the recall to.",
+                "default": [],
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max results to return (default 8, max 50).",
+                "default": 8,
+            },
+        },
+        "required": ["query"],
+    },
+}
 # ---------------------------------------------------------------------------
 
 class GalaxyMemProvider(MemoryProvider):
@@ -960,6 +984,7 @@ class GalaxyMemProvider(MemoryProvider):
             GM_EXPORT_SCHEMA,
             GM_SESSION_SEARCH_SCHEMA,
             GM_REASON_SCHEMA,
+            GM_EXPLAIN_RECALL_SCHEMA,
         ]
 
     # -- tool dispatch ------------------------------------------------------------
@@ -1029,6 +1054,8 @@ class GalaxyMemProvider(MemoryProvider):
 
                 elif tool_name == "gm_reason":
                     return self._handle_reason(args)
+                elif tool_name == "gm_explain_recall":
+                    return self._handle_explain_recall(args)
 
                 return tool_error(f"Unknown tool: {tool_name}")
 
@@ -1172,6 +1199,35 @@ class GalaxyMemProvider(MemoryProvider):
         if as_of is not None:
             payload["as_of"] = as_of.isoformat()
         return json.dumps(payload)
+
+    def _handle_explain_recall(self, args: dict) -> str:
+        """gm_explain_recall: show which retrieval arms selected each memory."""
+        from .recall import explain_recall
+        from .sanitize import clamp_int
+
+        query = (args.get("query") or "").strip()
+        if not query:
+            return tool_error("Missing required parameter: query")
+
+        limit = clamp_int(args.get("limit", 8), 8, lo=1, hi=50)
+        raw_entities = [e for e in (args.get("entities") or []) if (e or "").strip()]
+        entity_ids = self._resolve_entity_args(raw_entities)
+        if raw_entities and not entity_ids:
+            return tool_error(
+                "None of the given entity labels matched a tracked entity; "
+                "refusing to run an unscoped recall."
+            )
+
+        try:
+            results = explain_recall(query, self._store,
+                                     entity_ids=entity_ids or None, limit=limit)
+        except Exception as e:
+            self._record_failure()
+            self._warn_on_exc("GalaxyMem explain_recall failed", e)
+            return tool_error(f"Explain recall failed: {e}")
+
+        self._record_success()
+        return json.dumps({"query": query, "count": len(results), "results": results})
 
     def _resolve_entity_args(self, raw: list[str]) -> list[str]:
         """Resolve tool-supplied entity ids/labels to entity ids."""
