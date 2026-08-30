@@ -27,3 +27,6 @@ htmlcov/
 .coverage.*
 venv/
 scripts/
+.venv/
+__pycache__/
+*.egg-info/
