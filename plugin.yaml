@@ -1,5 +1,5 @@
 name: galaxymem
-version: 0.2.0
+version: 0.2.2
 description: "Entity-scoped memory with four-network epistemic split, decay, and autonomous reflection. SQLite-backed."
 hooks:
   - on_session_end
