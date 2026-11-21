@@ -182,6 +182,16 @@ pytest galaxymem/tests/ -v
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries and design decisions, [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute, and [AGENTS.md](AGENTS.md) if you're an AI agent setting this up for someone.
 
+## Disclosure
+
+GalaxyMem writes one SQLite database under `$HERMES_HOME/galaxymem/db`, or at `GALAXYMEM_DB_PATH` when set. Non-secret settings live in `$HERMES_HOME/galaxymem.json`.
+
+Pass 1 runs locally. Batched extraction, reflection, query expansion and reasoning call an LLM through the `auxiliary.galaxymem` task, using Hermes's provider configuration and credentials. The plugin does not read `auth.json` or `.env`, and it stores no API key for those calls.
+
+Embeddings run locally through fastembed. The first run downloads `BAAI/bge-small-en-v1.5` from Hugging Face, about 100 MB. When `GALAXYMEM_EMBEDDING_API_URL` is set, embedding text goes to that endpoint, and `GALAXYMEM_EMBEDDING_API_KEY` is read from the environment. The optional reranker downloads `cross-encoder/ms-marco-MiniLM-L-6-v2` from Hugging Face.
+
+Prefetch, turn sync and reflection run on background threads. Vault promotion writes proposal files only to paths you configure. There is no telemetry, no self-updater, no shell command and no compiled binary.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
