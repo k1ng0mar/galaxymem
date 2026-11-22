@@ -126,6 +126,8 @@ Everything is an environment variable with a `GALAXYMEM_` prefix:
 | `GALAXYMEM_MAX_MEMORIES` | `50000` | Hard cap on stored memories |
 | `GALAXYMEM_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model |
 | `GALAXYMEM_RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Recall reranker |
+| `GALAXYMEM_AUX_PROVIDER` | active model | Optional provider override for extraction and reflection |
+| `GALAXYMEM_AUX_MODEL` | active model | Optional model override for extraction and reflection |
 
 ## Tools (inside Hermes)
 

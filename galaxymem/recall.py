@@ -72,7 +72,7 @@ def get_hot_cache(store: Store, entity_ids: Optional[list[str]] = None) -> list[
     # Fetch a reasonable upper-bound of active memories at the DB level.
     # load only id/recall_count/last_recalled_at/created_at/text/entity_ids first,
     # sort by relevance, then take top N. This avoids loading 50k+ records
-    # into pandas on every hot_cache injection.
+    # into memory on every hot_cache injection.
     MAX_CANDIDATES = max(cfg.HOT_CACHE_K * 10, 200)
 
     try:
