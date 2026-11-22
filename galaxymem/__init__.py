@@ -5,7 +5,7 @@ autonomous reflection. Built for Hermes Agent but usable standalone.
 """
 
 PACKAGE_NAME = "galaxymem"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # `provider` is the ONLY Hermes-coupled module — it imports agent.* / tools.*
 # at module load. Guard it so the engine (store / retain / recall / reflect /
@@ -29,7 +29,6 @@ from .models import (
 )
 from .config import (
     DB_PATH,
-    EMBEDDING_BACKEND,
     EMBEDDING_MODEL,
     EMBEDDING_DIM,
 )
@@ -47,7 +46,6 @@ __all__ = [
     "EdgeKind",
     "LinkMethod",
     "DB_PATH",
-    "EMBEDDING_BACKEND",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIM",
 ]

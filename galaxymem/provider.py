@@ -71,7 +71,6 @@ def _load_config(hermes_home: Optional[str] = None) -> dict:
 
     config: dict[str, Any] = {
         "db_path": os.environ.get("GALAXYMEM_DB_PATH", default_db_path),
-        "embedding_backend": cfg.EMBEDDING_BACKEND,
         "embedding_model": cfg.EMBEDDING_MODEL,
         "embedding_dim": cfg.EMBEDDING_DIM,
     }
@@ -115,19 +114,14 @@ def _load_config(hermes_home: Optional[str] = None) -> dict:
 # in config.yaml (hermes model → Configure auxiliary models).
 AUX_TASK_KEY = "galaxymem"
 
-# Fallback defaults for the auxiliary task. Overridable via:
+# Optional overrides for the auxiliary task. With no override the task follows
+# the user's active model. Override via:
 #   1. galaxymem.json: {"aux": {"provider": "...", "model": "..."}}
 #   2. Environment variables: GALAXYMEM_AUX_PROVIDER / GALAXYMEM_AUX_MODEL
-_AUX_ENV_PROVIDER = os.environ.get("GALAXYMEM_AUX_PROVIDER", "custom:kilo")
-_AUX_ENV_MODEL = os.environ.get("GALAXYMEM_AUX_MODEL", "kilo-auto/free")
-
-
 def _load_aux_defaults(hermes_home: Optional[str] = None) -> dict:
-    """Load auxiliary LLM defaults from galaxymem.json; fall back to env/hardcoded."""
-    # Read env at call time (not import time) so vars set after startup apply;
-    # the module-level constants only supply the final hardcoded fallback.
-    env_provider = os.environ.get("GALAXYMEM_AUX_PROVIDER", _AUX_ENV_PROVIDER)
-    env_model = os.environ.get("GALAXYMEM_AUX_MODEL", _AUX_ENV_MODEL)
+    """Return explicit auxiliary overrides, or {} to follow the active model."""
+    provider = os.environ.get("GALAXYMEM_AUX_PROVIDER", "").strip()
+    model = os.environ.get("GALAXYMEM_AUX_MODEL", "").strip()
     if hermes_home:
         config_path = Path(hermes_home) / "galaxymem.json"
         if config_path.exists():
@@ -135,37 +129,46 @@ def _load_aux_defaults(hermes_home: Optional[str] = None) -> dict:
                 data = json.loads(config_path.read_text(encoding="utf-8"))
                 aux = data.get("aux", {})
                 if isinstance(aux, dict):
-                    return {
-                        "provider": aux.get("provider", env_provider),
-                        "model": aux.get("model", env_model),
-                    }
+                    provider = str(aux.get("provider") or provider).strip()
+                    model = str(aux.get("model") or model).strip()
             except Exception as e:
                 logger.warning(
                     "Failed to load aux defaults from galaxymem.json: %s", e)
-    return {"provider": env_provider, "model": env_model}
+    defaults: dict[str, str] = {}
+    if provider:
+        defaults["provider"] = provider
+    if model:
+        defaults["model"] = model
+    return defaults
 
 
 class _LLMClientAdapter:
-    """Adapts Hermes's auxiliary LLM plumbing to the .complete()/.chat()
-    protocols expected by retain.py and reflect.py.
+    """Adapts ctx.llm to the .complete()/.chat() protocols used by retain.py.
 
-    Calls route through agent.auxiliary_client.call_llm(task="galaxymem"),
-    which resolves provider/model from the registered auxiliary task config
-    (free-tier default, user-overridable) with Hermes's own fallback chain.
-    A ``model_complete`` kwarg to initialize(), when provided, overrides this
-    (used by tests).
+    Calls route through the plugin's registered auxiliary task so the host owns
+    credentials and model routing. A ``model_complete`` kwarg to initialize(),
+    when provided, overrides this (used by tests).
     """
 
-    def __init__(self, complete_fn: Optional[Any] = None):
+    def __init__(self, complete_fn: Optional[Any] = None, llm: Optional[Any] = None):
         self._complete_fn = complete_fn
+        self._llm = llm
 
     def _call(self, messages: list[dict[str, str]]) -> str:
         if self._complete_fn is not None:
             parts = [f"[{m.get('role', 'user')}] {m.get('content', '')}" for m in messages]
             return self._complete_fn("\n".join(parts))
-        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
-        response = call_llm(task=AUX_TASK_KEY, messages=messages, max_tokens=2000)
-        return extract_content_or_reasoning(response) or ""
+        if self._llm is None:
+            raise RuntimeError(
+                "GalaxyMem has no LLM route; ctx.llm was unavailable at register()"
+            )
+        result = self._llm.complete(
+            messages=messages,
+            task=AUX_TASK_KEY,
+            max_tokens=2000,
+            purpose="galaxymem.extraction",
+        )
+        return getattr(result, "text", "") or ""
 
     def complete(self, prompt: str) -> str:
         return self._call([{"role": "user", "content": prompt}])
@@ -621,7 +624,9 @@ GM_EXPLAIN_RECALL_SCHEMA = {
 class GalaxyMemProvider(MemoryProvider):
     """GalaxyMem — entity-scoped SQLite memory with decay and reflection."""
 
-    def __init__(self):
+    def __init__(self, llm: Optional[Any] = None):
+        self._llm = llm
+        self._hermes_home: Optional[str] = None
         self._config: Optional[dict] = None
         self._db_path: str = ""
         self._store: Optional[Any] = None  # Store instance
@@ -684,14 +689,8 @@ class GalaxyMemProvider(MemoryProvider):
                 "env_var": "GALAXYMEM_DB_PATH",
             },
             {
-                "key": "embedding_backend",
-                "description": "Embedding backend: 'fastembed' (local) or 'api' (external)",
-                "default": "fastembed",
-                "env_var": "GALAXYMEM_EMBEDDING_BACKEND",
-            },
-            {
                 "key": "embedding_model",
-                "description": "Embedding model name (fastembed or API)",
+                "description": "Local fastembed model name",
                 "default": "BAAI/bge-small-en-v1.5",
                 "env_var": "GALAXYMEM_EMBEDDING_MODEL",
             },
@@ -701,6 +700,7 @@ class GalaxyMemProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         hermes_home = kwargs.get("hermes_home")
+        self._hermes_home = str(hermes_home) if hermes_home else None
         self._config = _load_config(hermes_home)
         self._db_path = self._config["db_path"]
         self._session_id = session_id or "default"
@@ -712,7 +712,9 @@ class GalaxyMemProvider(MemoryProvider):
 
         # Wire up LLM client if gateway provided a complete function
         model_complete = kwargs.get("model_complete")
-        self._llm_client = _LLMClientAdapter(complete_fn=model_complete)
+        self._llm_client = _LLMClientAdapter(
+            complete_fn=model_complete, llm=self._llm
+        )
 
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1764,10 +1766,15 @@ class GalaxyMemProvider(MemoryProvider):
             return tool_error(f"{type(e).__name__}: {e}")
 
     def _persist_config(self, updates: dict) -> None:
-        """Merge config updates into $HERMES_HOME/galaxymem.json."""
+        """Merge config updates into the active profile's galaxymem.json."""
         try:
-            hermes_home = os.environ.get("HERMES_HOME",
-                                         str(Path.home() / ".hermes"))
+            from utils import atomic_json_write
+
+            hermes_home = self._hermes_home
+            if not hermes_home:
+                from hermes_constants import get_hermes_home
+
+                hermes_home = str(get_hermes_home())
             config_path = Path(hermes_home) / "galaxymem.json"
             existing: dict = {}
             if config_path.exists():
@@ -1776,7 +1783,7 @@ class GalaxyMemProvider(MemoryProvider):
                 except Exception:
                     logger.warning("Could not read galaxymem.json; overwriting.")
             existing.update(updates)
-            config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            atomic_json_write(config_path, existing, mode=0o600)
         except Exception as e:
             logger.warning("Failed to persist galaxymem.json: %s", e)
 
@@ -1903,11 +1910,10 @@ class GalaxyMemProvider(MemoryProvider):
 
 def register(ctx) -> None:
     """Register GalaxyMem as a memory provider plugin."""
-    ctx.register_memory_provider(GalaxyMemProvider())
+    ctx.register_memory_provider(GalaxyMemProvider(llm=getattr(ctx, "llm", None)))
 
     # LLM-backed extraction/reflection routes through auxiliary.galaxymem.
-    # Defaults are loaded from galaxymem.json via _load_aux_defaults; the user
-    # can repoint via `hermes model → Configure auxiliary models` or env vars.
+    # With no explicit override the task follows the user's active model.
     aux_defaults = _load_aux_defaults(getattr(ctx, "hermes_home", None))
     try:
         ctx.register_auxiliary_task(

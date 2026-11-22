@@ -4,15 +4,11 @@ Idempotent. Skips memories that already have occurred_at. Operates in
 batches with retry. No re-embedding; this only writes the occurred_at
 column on memories that get a date from the LLM.
 
-Run:
-    python -m galaxymem.backfill_occurred_at [--limit N] [--batch B]
-
-Logs the count updated. Safe to re-run — re-running only touches
-memories that still have NULL occurred_at.
+Call backfill(store, llm_client) from a Hermes plugin or another runtime that
+supplies an LLM client. There is no standalone CLI.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import re
@@ -151,36 +147,4 @@ def backfill(store: Store, llm_client, batch: int = _BATCH,
     }
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Backfill occurred_at for memories missing it")
-    ap.add_argument("--limit", type=int, default=_LIMIT_DEFAULT,
-                    help=f"max memories to process (default {_LIMIT_DEFAULT})")
-    ap.add_argument("--batch", type=int, default=_BATCH,
-                    help=f"batch size (default {_BATCH})")
-    ap.add_argument("--db-path", type=str, default=None,
-                    help="override GALAXYMEM_DB_PATH")
-    args = ap.parse_args()
 
-    from . import config as cfg
-    from pathlib import Path
-    db_path = Path(args.db_path) if args.db_path else cfg.DB_PATH
-    store = Store(db_path=db_path).open()
-
-    # We need an LLM client. The provider has one — try to import it.
-    try:
-        from .provider import _LLMClientAdapter
-        from agent.llm import get_default_client
-        llm = _LLMClientAdapter(get_default_client())
-    except Exception as e:
-        logger.error("Could not obtain an LLM client: %s", e)
-        logger.error("Run this from inside Hermes, or pass a client explicitly.")
-        return
-
-    report = backfill(store, llm, batch=args.batch, limit=args.limit)
-    print(json.dumps(report, indent=2))
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    main()

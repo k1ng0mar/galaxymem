@@ -12,9 +12,6 @@ from .sanitize import env_bool, env_float, env_int
 # Default to ~/.galaxymem/db for standalone use.
 # When loaded as a Hermes plugin, provider.py overrides via resolve_db_path(hermes_home).
 DB_PATH = Path(os.environ.get("GALAXYMEM_DB_PATH", str(Path.home() / ".galaxymem" / "db")))
-EMBEDDING_BACKEND = os.environ.get("GALAXYMEM_EMBEDDING_BACKEND", "fastembed")
-EMBEDDING_API_URL = os.environ.get("GALAXYMEM_EMBEDDING_API_URL", "")
-EMBEDDING_API_KEY = os.environ.get("GALAXYMEM_EMBEDDING_API_KEY", "")
 EMBEDDING_MODEL = os.environ.get("GALAXYMEM_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM = env_int("GALAXYMEM_EMBEDDING_DIM", 384, minimum=8, maximum=4096)
 
