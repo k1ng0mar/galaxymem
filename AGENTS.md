@@ -168,7 +168,7 @@ For Hermes Agent, config can also go in `$HERMES_HOME/galaxymem.json`.
 2. **The store layer is Hermes-agnostic.** Only `provider.py` imports Hermes
    internals. Keep it that way.
 3. **No new dependencies without justification.** The current deps are
-   sqlite-vec, fastembed, pydantic, numpy, pandas, requests. The viewer adds
+   sqlite-vec, fastembed, pydantic and numpy. The viewer adds
    fastapi + uvicorn.
 4. **Python 3.10+ required.** The codebase uses `from __future__ import
    annotations` and union type syntax.
