@@ -182,7 +182,7 @@ When an AI agent is setting up GalaxyMem for a user, verify each item:
 - [ ] `python3 --version` shows 3.10+
 - [ ] `pip install -e .` completed without errors
 - [ ] `python -c "from galaxymem.store_sqlite import Store"` succeeds
-- [ ] `python -c "import galaxymem; print(galaxymem.__version__)"` prints `0.2.0`
+- [ ] `python -c "import galaxymem; print(galaxymem.__version__)"` prints `0.2.3`
 - [ ] If Hermes: `GalaxyMemProvider` is not `None` when imported inside Hermes
 - [ ] If standalone: `GalaxyMemProvider` is `None` (expected, not an error)
 - [ ] The DB path is writable and has disk space (~500MB headroom)
